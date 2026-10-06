@@ -12,7 +12,7 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use maki_storage::StateDir;
-use maki_storage::auth::{OAuthTokens, load_tokens, lock_tokens, save_tokens};
+use maki_storage::auth::{OAuthTokens, delete_tokens, load_tokens, lock_tokens, save_tokens};
 
 use crate::AgentError;
 use crate::retry::RetryPolicy;
@@ -39,6 +39,7 @@ const LOW_SPEED_BYTES_PER_SEC: u32 = 1;
 const UNMAPPED_SSE_ERROR_STATUS: u16 = 400;
 const EMPTY_SSE_ERROR_MESSAGE: &str = "provider sent an error frame with no detail";
 pub(crate) const UNAUTHORIZED_STATUS: u16 = 401;
+const BAD_REQUEST_STATUS: u16 = 400;
 const AUTHORIZATION_HEADER: &str = "authorization";
 const BEARER_PREFIX: &str = "Bearer ";
 
@@ -96,6 +97,11 @@ impl From<&maki_config::ProviderConfig> for Timeouts {
 /// token means only a real refresh gets us out of the loop, whatever the
 /// expiry clock says, because that clock is wrong exactly when a server
 /// revokes early or the local time drifts.
+///
+/// Only a 400 or 401 from the token endpoint, its answer for a dead refresh
+/// token, deletes the token file. Anything else keeps it (a 429, a 5xx, a
+/// firewall's 403, a proxy's login page, a dropped connection): a token kept
+/// by mistake costs one failed refresh, one deleted by mistake a new login.
 pub(crate) fn refreshed_tokens(
     dir: &StateDir,
     provider: &str,
@@ -112,9 +118,21 @@ pub(crate) fn refreshed_tokens(
     if rejected.is_none_or(|stale| current.access != stale) && !current.is_expired() {
         return Ok(current);
     }
-    let fresh = refresh(&current)?;
+    let fresh = refresh(&current).inspect_err(|e| {
+        let cleared = matches!(
+            e,
+            AgentError::Api {
+                status: BAD_REQUEST_STATUS | UNAUTHORIZED_STATUS,
+                ..
+            }
+        );
+        warn!(provider, cleared, error = %e, "OAuth refresh failed");
+        if cleared {
+            let _ = delete_tokens(dir, provider);
+        }
+    })?;
     // Not `?`: every caller reads an error here as "these credentials are
-    // dead" and deletes the token file, so a full disk would log the user out
+    // dead" and falls back to other auth, so a full disk would log the user out
     // over a refresh that actually succeeded. The run keeps the token it just
     // got and the next start refreshes again.
     if let Err(e) = save_tokens(dir, provider, &fresh) {
@@ -580,6 +598,7 @@ mod tests {
     const UNAVAILABLE_STATUS: u16 = 502;
     const UNAVAILABLE_TAG: &str = "provider_unavailable";
     const TEST_PROVIDER: &str = "openai";
+    const PROXY_LOGIN_PAGE: &str = "<html><body>Sign in to continue</body></html>";
     const ON_DISK: &str = "on-disk-access";
     const FRESH: &str = "fresh-access";
     const REFRESHED: &str = "refresh should have run";
@@ -626,6 +645,20 @@ mod tests {
         let state = StateDir::from_path(dir.path().to_path_buf());
         let got = refreshed_tokens(&state, TEST_PROVIDER, rejected, fresh_tokens).expect("refresh");
         assert_eq!(got.access, expected, "{reason}");
+    }
+
+    #[test_case(AgentError::api(503, ERROR_MESSAGE), true  ; "server_error_keeps_tokens")]
+    #[test_case(AgentError::api(429, ERROR_MESSAGE), true  ; "rate_limit_keeps_tokens")]
+    #[test_case(AgentError::api(403, ERROR_MESSAGE), true  ; "firewall_block_keeps_tokens")]
+    #[test_case(AgentError::from(serde_json::from_str::<Value>(PROXY_LOGIN_PAGE).unwrap_err()), true ; "proxy_login_page_keeps_tokens")]
+    #[test_case(AgentError::api(400, ERROR_MESSAGE), false ; "invalid_grant_clears_tokens")]
+    #[test_case(AgentError::api(401, ERROR_MESSAGE), false ; "unauthorized_clears_tokens")]
+    fn refreshed_tokens_clears_only_a_dead_token(error: AgentError, kept: bool) {
+        let dir = state_with_tokens(ON_DISK);
+        let state = StateDir::from_path(dir.path().to_path_buf());
+        refreshed_tokens(&state, TEST_PROVIDER, Some(ON_DISK), |_| Err(error))
+            .expect_err("refresh should fail");
+        assert_eq!(load_tokens(&state, TEST_PROVIDER).is_some(), kept);
     }
 
     #[test_case(Some(EXPIRED), Some(EXPIRED), true  ; "held_expired")]

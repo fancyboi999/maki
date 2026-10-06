@@ -13,7 +13,7 @@ use tracing::{debug, error, warn};
 
 use crate::AgentError;
 use crate::providers::oauth_loopback::{self, LoginMethod, Loopback};
-use crate::providers::{KeyPool, ResolvedAuth, urlenc};
+use crate::providers::{KeyPool, ResolvedAuth, UNAUTHORIZED_STATUS, urlenc};
 
 use super::catalog;
 
@@ -125,7 +125,7 @@ fn post_form(url: &str, body: &str, timeout: Duration) -> Result<(u16, String), 
     // A transport error, not `Config`: only the token endpoint's answer may clear the tokens.
     let mut resp = client.send(request)?;
     let status = resp.status().as_u16();
-    let text = resp.text().unwrap_or_default();
+    let text = resp.text()?;
     Ok((status, text))
 }
 
@@ -151,9 +151,10 @@ fn into_oauth_tokens(
 
 pub(crate) fn refresh_tokens(tokens: &OAuthTokens) -> Result<OAuthTokens, AgentError> {
     if tokens.refresh.is_empty() {
-        return Err(AgentError::Config {
-            message: "xAI credentials are expired and do not include a refresh token".into(),
-        });
+        return Err(AgentError::api(
+            UNAUTHORIZED_STATUS,
+            "xAI credentials are expired and do not include a refresh token",
+        ));
     }
     debug!(expired = tokens.is_expired(), "refreshing xAI OAuth tokens");
 
@@ -164,9 +165,10 @@ pub(crate) fn refresh_tokens(tokens: &OAuthTokens) -> Result<OAuthTokens, AgentE
     );
     let (status, body_text) = post_form(TOKEN_URL, &form_body, TOKEN_EXCHANGE_TIMEOUT)?;
     if status != 200 {
-        return Err(AgentError::Config {
-            message: format!("xAI token refresh failed ({status}): {body_text}"),
-        });
+        return Err(AgentError::api(
+            status,
+            format!("xAI token refresh failed: {body_text}"),
+        ));
     }
     let token_resp: TokenResponse = serde_json::from_str(&body_text)?;
     into_oauth_tokens(token_resp, Some(tokens.refresh.clone()))
@@ -599,6 +601,24 @@ fn normalize_epoch_ms(value: f64) -> u64 {
 mod tests {
     use super::*;
     use test_case::test_case;
+
+    #[test]
+    fn refresh_without_refresh_token_is_a_dead_token() {
+        let tokens = OAuthTokens {
+            access: "legacy-access".into(),
+            refresh: String::new(),
+            expires: 0,
+            account_id: None,
+        };
+        let err = refresh_tokens(&tokens).unwrap_err();
+        assert!(matches!(
+            err,
+            AgentError::Api {
+                status: UNAUTHORIZED_STATUS,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn parse_grok_oidc_scope() {

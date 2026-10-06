@@ -6,7 +6,7 @@ use maki_storage::StateDir;
 use maki_storage::auth::OAuthTokens;
 use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::model::Model;
 use crate::provider::{BoxFuture, Provider};
@@ -102,8 +102,6 @@ impl Xai {
                 }
                 Err(e) if e.is_retryable() => Err(e),
                 Err(e) => {
-                    warn!(error = %e, "xAI OAuth refresh failed, clearing stale tokens");
-                    let _ = maki_storage::auth::delete_tokens(&storage, auth::PROVIDER);
                     catalog::invalidate();
                     if let Ok((fallback, tokens)) = auth::resolve(&storage) {
                         *shared.lock().unwrap() = fallback;
@@ -140,11 +138,12 @@ impl Xai {
         Fut: std::future::Future<Output = Result<T, AgentError>>,
     {
         let result = f().await;
-        if self.is_oauth()
-            && matches!(&result, Err(e) if e.is_auth_error())
-            && self.refresh_oauth().await.is_ok()
-        {
-            return f().await;
+        if self.is_oauth() && matches!(&result, Err(e) if e.is_auth_error()) {
+            match self.refresh_oauth().await {
+                Ok(()) => return f().await,
+                Err(e) if e.is_retryable() => return Err(e),
+                Err(_) => {}
+            }
         }
         result
     }

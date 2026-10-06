@@ -377,8 +377,6 @@ impl OpenAi {
                 }
                 Err(e) if e.is_retryable() => Err(e),
                 Err(e) => {
-                    warn!(error = %e, "OpenAI OAuth refresh failed, clearing stale tokens");
-                    let _ = maki_storage::auth::delete_tokens(&storage, auth::PROVIDER);
                     if let Ok((fallback, tokens)) = auth::resolve(&storage) {
                         *shared.lock().unwrap() = fallback;
                         *held.lock().unwrap() = tokens;
@@ -414,11 +412,12 @@ impl OpenAi {
         Fut: std::future::Future<Output = Result<T, AgentError>>,
     {
         let result = f().await;
-        if self.is_oauth()
-            && matches!(&result, Err(e) if e.is_auth_error())
-            && self.refresh_oauth().await.is_ok()
-        {
-            return f().await;
+        if self.is_oauth() && matches!(&result, Err(e) if e.is_auth_error()) {
+            match self.refresh_oauth().await {
+                Ok(()) => return f().await,
+                Err(e) if e.is_retryable() => return Err(e),
+                Err(_) => {}
+            }
         }
         result
     }

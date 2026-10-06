@@ -261,11 +261,13 @@ pub(crate) fn refresh_tokens(tokens: &OAuthTokens) -> Result<OAuthTokens, AgentE
     // A transport error, not `Config`: only the token endpoint's answer may clear the tokens.
     let mut resp = client.send(request)?;
 
-    if resp.status().as_u16() != 200 {
+    let status = resp.status().as_u16();
+    if status != 200 {
         let body_text = resp.text().unwrap_or_else(|_| "unknown error".into());
-        return Err(AgentError::Config {
-            message: format!("OpenAI token refresh failed: {body_text}"),
-        });
+        return Err(AgentError::api(
+            status,
+            format!("OpenAI token refresh failed: {body_text}"),
+        ));
     }
 
     let body_text = resp.text()?;
