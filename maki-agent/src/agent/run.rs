@@ -79,7 +79,9 @@ pub async fn resolve_compaction_model(
         maki_providers::model_registry::spec_for_tier_any(maki_providers::ModelTier::Compaction)
         && model_policy.allows(&spec)
         && let Ok(mut m) = Model::from_spec(&spec)
-        && let Ok(p) = maki_providers::provider::from_model_async(&mut m, timeouts).await
+        && let Ok(p) = maki_providers::provider::from_model_async(&mut m, timeouts)
+            .await
+            .inspect_err(|err| warn!(provider = %m.provider, model = %m.id, error = %err, "compaction model unavailable, falling back to the session model"))
     {
         return (Arc::from(p), m);
     }
