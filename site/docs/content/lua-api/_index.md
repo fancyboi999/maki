@@ -6866,7 +6866,7 @@ Plugins can read, style, change and send the chat input:
 | Job | Call |
 | --- | --- |
 | Read the text, the cursor and the selection | [`input`](#maki-ui-input) |
-| Style text by what it says, like a `$skill:go` chip | [`input_rules`](#maki-ui-input_rules) |
+| Style text by what it says, like the skill plugin's `$name` mentions | [`input_rules`](#maki-ui-input_rules) |
 | Style text from plugin state, like ghost text or diagnostics | [`input_decorate`](#maki-ui-input_decorate) |
 | Change the text, the cursor or the selection | [`input_edit`](#maki-ui-input_edit) |
 | Send the input, as Enter does | [`input_submit`](#maki-ui-input_submit) |
@@ -7609,14 +7609,14 @@ pushed marks.
 **Example:**
 
 ```lua
--- Draw `$skill:go` as a ` go ` chip the cursor steps over:
+-- Draw a link as a ` host ` chip the cursor steps over:
 maki.ui.input_rules({
-  ns = "skill",
-  pattern = [[\$skill:([\w-]+)]],
+  ns = "link",
+  pattern = [[https?://([^/\s]+)\S*]],
   mark = { conceal = " $1 ", hl = "accent", atomic = true },
 })
 -- And remove it again:
-maki.ui.input_rules({ ns = "skill" })
+maki.ui.input_rules({ ns = "link" })
 -- Bold text without its stars, unless the cursor is on it:
 maki.ui.input_rules({
   ns = "md",

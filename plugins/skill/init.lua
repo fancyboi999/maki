@@ -2,6 +2,9 @@ local SKILL_FILE = "SKILL.md"
 local NOT_FOUND = "skill not found: "
 local REFERENCE_FILE = "lua-api.md"
 local REFERENCE_UNAVAILABLE = "(unavailable; full reference inlined below)"
+local MENTION_NS = "mention"
+local MENTION_MARK = { hl = "accent", atomic = true }
+local COMPLETION_SLOT = "completion.sources"
 local shorten_path = require("maki.shorten_path")
 local ToolView = require("maki.tool_view")
 local helpers = require("skill_helpers")
@@ -9,6 +12,9 @@ local parse_frontmatter = helpers.parse_frontmatter
 local build_skill_list = helpers.build_skill_list
 local format_output = helpers.format_output
 local parse_output = helpers.parse_output
+local mention_pattern = helpers.mention_pattern
+local mention_items = helpers.mention_items
+local skill_name = helpers.skill_name
 
 local PROJECT_SKILL_DIRS = {
   ".maki/skills",
@@ -131,6 +137,25 @@ local function discover_skills()
   return skills
 end
 
+local known_skills = {}
+local marked_pattern = nil
+
+-- What a `$` mention offers and lights up: the skills the last discovery
+-- found. Discovery reads every SKILL.md, far too slow to redo per keystroke.
+local function remember_skills(skills)
+  known_skills = skills
+  local pattern = mention_pattern(skills)
+  if pattern == marked_pattern then
+    return
+  end
+  marked_pattern = pattern
+  if pattern then
+    maki.ui.input_rules({ ns = MENTION_NS, pattern = pattern, mark = MENTION_MARK })
+  else
+    maki.ui.input_rules({ ns = MENTION_NS })
+  end
+end
+
 local function view_opts(ctx)
   local tol = ctx:tool_output_lines()
   return { max_lines = (tol and tol.other) or 20, keep = "head" }
@@ -158,7 +183,9 @@ local function skill_view(output, ctx)
 end
 
 local boot_skills = discover_skills()
+remember_skills(boot_skills)
 local description = "Load a skill that provides instructions and workflows for specific tasks."
+  .. " When the user mentions a skill as $name, load it before anything else."
   .. build_skill_list(boot_skills)
 
 maki.api.register_tool({
@@ -186,11 +213,13 @@ maki.api.register_tool({
       return { llm_output = "error: name is required", is_error = true }
     end
 
+    local name = skill_name(input.name)
     local skills = discover_skills()
-    local skill = skills[input.name]
+    remember_skills(skills)
+    local skill = skills[name]
     if not skill then
       local available = build_skill_list(skills)
-      return { llm_output = NOT_FOUND .. input.name .. available, is_error = true }
+      return { llm_output = NOT_FOUND .. name .. available, is_error = true }
     end
     if skill.resolve then
       skill.content = skill.resolve()
@@ -202,3 +231,14 @@ maki.api.register_tool({
     return result
   end,
 })
+
+maki.api.set_slot(COMPLETION_SLOT, function(prev, sources)
+  table.insert(sources, {
+    trigger = helpers.MENTION_SIGIL,
+    name = "skills",
+    complete = function(query)
+      return mention_items(known_skills, query)
+    end,
+  })
+  return prev(sources)
+end)

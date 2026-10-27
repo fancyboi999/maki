@@ -55,7 +55,11 @@ The frontmatter is optional. Without it, the directory name is the skill name an
 
 The `skill` tool lists every skill it found, the agent calls it with a name and gets the body back. A wrong name errors and reprints the list so the model can pick again.
 
-Skills are not slash commands: typing `/git-release` does nothing unless you also add a [custom command](/docs/commands/#custom-commands). Ask the agent to use a skill, or let it pick one on its own.
+To pick a skill yourself, mention it with `$` and its name, like `$git-release`, anywhere in your message. The mention lights up once the name matches a skill, and Backspace removes it whole. The agent is told to load a mentioned skill before anything else. Codex uses the same syntax, so prompts carry over. Only names made of letters, digits, `_` and `-` can be mentioned. For any other name, ask in words.
+
+With the [completion popup](/docs/context/#pointing-at-a-file-with) on, typing `$` lists your skills with their descriptions.
+
+Skills are not slash commands: typing `/git-release` does nothing unless you also add a [custom command](/docs/commands/#custom-commands). Without a mention, the agent picks a skill on its own when the task matches its description.
 
 ## The builtin: maki-plugin-dev
 

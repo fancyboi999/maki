@@ -22,7 +22,7 @@ use crate::runtime::{HookRun, PromptRun, Request};
 /// Every `agent.*` slot steers what the agent does next: the prompt it
 /// answers, whether it stops, what it remembers after a compaction. No
 /// narrower price would be honest.
-const AGENT_SLOT_COST: LayerCost<'static> = LayerCost::TOTAL;
+pub(crate) const AGENT_SLOT_COST: LayerCost<'static> = LayerCost::TOTAL;
 
 /// Conversation content, both ways, on every stage. A layer that sees the
 /// call reads what the model wrote (the file `write` puts on disk, the page

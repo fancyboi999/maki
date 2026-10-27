@@ -198,7 +198,7 @@ maki.setup({
 
 On a large repository the first index walk takes a moment. The popup shows `scanning…` and fills in when the walk finishes. If the walk has not reported back after a few seconds, it shows `no matches`. Other options are under `plugins.completion` in [configuration](/docs/configuration/).
 
-Plugins can add their own entries to the popup, such as issues after `#` or people after `@`. See [completion sources](/docs/hooks/#completion-sources).
+Typing `$` lists your [skills](/docs/skills/#how-it-gets-used). Plugins can add their own entries to the popup, such as issues after `#` or people after `@`. See [completion sources](/docs/hooks/#completion-sources).
 
 ## When the window fills
 

@@ -3063,15 +3063,18 @@ mod bundled_manifests {
 
     use include_dir::{Dir, DirEntry, File};
     use maki_agent::tools::{ToolRegistry, ToolSource};
-    use maki_config::{DEFAULT_BUILTINS, PluginsConfig};
+    use maki_config::DEFAULT_BUILTINS;
+    use serde_json::Value;
     use strum::VariantArray;
     use test_case::test_case;
 
-    use super::{Arc, BUNDLED_PLUGINS, HashMap, PluginHost, bundled_permissions, lib_dir};
+    use super::{Arc, BUNDLED_PLUGINS, PluginHost, bundled_permissions, lib_dir};
     use crate::agent_autocmd::HostEventKind;
+    use crate::api::slot::{AGENT_PREFIX, LayerCost};
     use crate::api::util::command::BuiltinAction;
     use crate::docs::{DocKind, api_docs};
-    use crate::plugin_permissions::{Permission, SENDS_PROMPT};
+    use crate::hook::AGENT_SLOT_COST;
+    use crate::plugin_permissions::{Permission, PluginPermissions, SENDS_PROMPT};
 
     const TEST_DIR: &str = "tests";
     const LUA_EXT: &str = "lua";
@@ -3086,6 +3089,20 @@ mod bundled_manifests {
     const DISABLED_WAKE: &str = "false";
     const CREATE_AUTOCMD: &str = "maki.api.create_autocmd";
     const LUA_QUOTES: [char; 2] = ['"', '\''];
+    const SLOT_LAYERS_PLUGIN: &str = "slot_layers_probe";
+    const SLOT_LAYERS_PATH: &str = "SLOT_LAYERS_PATH";
+    /// One JSON line per layer: its slot, the slot's owner and price as
+    /// `get_slots` reports them, and the plugin that set it.
+    const SLOT_LAYERS_LUA: &str = r#"
+local lines = {}
+for name, slot in pairs(maki.api.get_slots()) do
+  for _, filler in ipairs(slot.fillers) do
+    local layer = { slot = name, owner = slot.owner, capability = slot.capability, plugin = filler }
+    table.insert(lines, (assert(maki.json.encode(layer))))
+  end
+end
+assert(maki.fs.write(SLOT_LAYERS_PATH, table.concat(lines, "\n")))
+"#;
 
     /// Every guarded `maki.*` function under the dotted name lua calls it by.
     fn guarded_calls() -> Vec<(String, Permission)> {
@@ -3108,12 +3125,7 @@ mod bundled_manifests {
     /// Read off a real load rather than off the source text, because
     /// `register_tool` refuses a permission the plugin lacks, which makes
     /// shipping the tool itself a use of it.
-    fn tool_permissions() -> BTreeMap<String, BTreeSet<Permission>> {
-        let registry = Arc::new(ToolRegistry::new());
-        let mut host = PluginHost::new(Arc::clone(&registry)).expect("host starts");
-        host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
-            .expect("every bundled plugin loads");
-
+    fn tool_permissions(registry: &ToolRegistry) -> BTreeMap<String, BTreeSet<Permission>> {
         let mut out: BTreeMap<String, BTreeSet<Permission>> = BTreeMap::new();
         for tool in registry.iter().iter() {
             let (ToolSource::Lua { plugin }, Some(reach)) = (&tool.source, tool.tool.reach())
@@ -3127,6 +3139,53 @@ mod bundled_manifests {
         out
     }
 
+    /// Read off a real load too, because an owner prices its slot in its own
+    /// lua, often through a constant, and a layer that cannot pay is skipped
+    /// without a word. Priced as the runtime prices it: a slot another plugin
+    /// declared costs what that plugin named, every permission if it named
+    /// none, and an `agent.` slot costs [`AGENT_SLOT_COST`]. Maki's other
+    /// slots are priced per call, by the tool the call reaches.
+    fn slot_layer_prices(host: &PluginHost) -> BTreeMap<String, BTreeMap<Permission, String>> {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(SLOT_LAYERS_PLUGIN);
+        let probe = SLOT_LAYERS_LUA.replace(SLOT_LAYERS_PATH, &format!("{path:?}"));
+        host.load_source(SLOT_LAYERS_PLUGIN, &probe)
+            .expect("the slot probe runs");
+
+        let mut out: BTreeMap<String, BTreeMap<Permission, String>> = BTreeMap::new();
+        for line in std::fs::read_to_string(&path)
+            .expect("the probe wrote")
+            .lines()
+        {
+            let layer: Value = serde_json::from_str(line).expect("a layer is JSON");
+            let field = |name: &str| layer[name].as_str();
+            let plugin = field("plugin").expect("a layer names its plugin");
+            let slot = field("slot").expect("a layer names its slot");
+            let named: Option<Vec<Permission>> = layer.get("capability").map(|price| {
+                price
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|key| {
+                        let key = key.as_str().expect("a permission name");
+                        Permission::from_key(key)
+                            .unwrap_or_else(|| panic!("unknown permission {key}"))
+                    })
+                    .collect()
+            });
+            let cost = match field("owner") {
+                Some(owner) if owner == plugin => continue,
+                Some(_) => named.as_deref().map_or(LayerCost::TOTAL, LayerCost::Named),
+                None if slot.starts_with(AGENT_PREFIX) => AGENT_SLOT_COST,
+                None => continue,
+            };
+            let paid = out.entry(plugin.to_owned()).or_default();
+            for permission in cost.missing(&PluginPermissions::denied()) {
+                paid.entry(permission).or_insert_with(|| slot.to_owned());
+            }
+        }
+        out
+    }
     /// Specs, not runtime code. What a test calls must not buy the plugin a
     /// permission its handlers never use.
     fn runtime_lua(file: &'static File<'static>) -> Option<&'static str> {
@@ -3251,7 +3310,11 @@ mod bundled_manifests {
 
     #[test]
     fn bundled_manifests_match_the_permissions_their_plugin_uses() {
-        let tools = tool_permissions();
+        let registry = Arc::new(ToolRegistry::new());
+        let host = PluginHost::with_all_builtins(Arc::clone(&registry))
+            .expect("every bundled plugin loads");
+        let tools = tool_permissions(&registry);
+        let slots = slot_layer_prices(&host);
         let guarded = guarded_calls();
         let mut drift = Vec::new();
         // `lib` is the one bundled directory that never loads on its own, so it
@@ -3268,6 +3331,11 @@ mod bundled_manifests {
                 .flatten()
                 .map(|permission| (*permission, format!("a tool exposing '{permission}'")))
                 .collect();
+            for (permission, slot) in slots.get(plugin.name).into_iter().flatten() {
+                needed
+                    .entry(*permission)
+                    .or_insert_with(|| format!("a layer on '{slot}'"));
+            }
             for source in runtime_sources(&plugin.dir) {
                 for (name, permission) in &guarded {
                     if calls(source, name) {

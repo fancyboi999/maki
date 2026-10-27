@@ -342,7 +342,8 @@ result.
 
 ## Completion sources
 
-The bundled completion plugin offers files after `@`. Other plugins add entries
+The bundled completion plugin offers files after `@`, and the skill plugin
+offers [skills](/docs/skills/#how-it-gets-used) after `$`. Other plugins add entries
 through the `completion.sources` slot. Layering it needs `session_read`,
 because a source sees what the user is typing. Append your sources and pass
 the list on:

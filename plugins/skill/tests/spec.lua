@@ -3,6 +3,9 @@ local parse_frontmatter = helpers.parse_frontmatter
 local build_skill_list = helpers.build_skill_list
 local format_output = helpers.format_output
 local parse_output = helpers.parse_output
+local mention_pattern = helpers.mention_pattern
+local mention_items = helpers.mention_items
+local skill_name = helpers.skill_name
 
 local LOCATION = "/home/u/.config/maki/skills/release/SKILL.md"
 
@@ -129,6 +132,58 @@ end
 case("parse_output_rejects_text_that_is_not_a_listing", function()
   eq(parse_output("error: name is required"), nil)
   eq(parse_output("skill not found: x\n\n<available_skills>\n- a: b\n</available_skills>"), nil)
+end)
+
+-- ── $name mentions ──
+
+local function skill(description)
+  return { description = description }
+end
+
+case("mention_pattern_puts_longer_names_first", function()
+  local pattern = mention_pattern({ go = skill(""), ["go-review"] = skill(""), ab = skill("") })
+  eq(pattern, [[\B\$(?:go-review|ab|go)\b]])
+end)
+
+case("mention_pattern_skips_names_a_mention_cannot_hold", function()
+  local pattern = mention_pattern({
+    ["two words"] = skill(""),
+    ["trailing-"] = skill(""),
+    ["-leading"] = skill(""),
+    ["a.b"] = skill(""),
+    ["(x|y)"] = skill(""),
+    [42] = skill(""),
+    ok = skill(""),
+  })
+  eq(pattern, [[\B\$(?:ok)\b]])
+end)
+
+case("mention_pattern_is_nil_without_mentionable_skills", function()
+  eq(mention_pattern({}), nil)
+  eq(mention_pattern({ ["two words"] = skill("") }), nil)
+end)
+
+case("mention_items_complete_the_query_to_a_mention", function()
+  local items = mention_items({
+    ["go-review"] = skill("Review Go code"),
+    release = skill("Cut a release"),
+    ["two words"] = skill("Unreachable"),
+  }, "gorev")
+  eq(#items, 1)
+  eq(items[1].text, "$go-review")
+  eq(items[1].label, "Review Go code")
+end)
+
+case("mention_items_list_every_mentionable_skill_for_an_empty_query", function()
+  local items = mention_items({ b = skill(""), a = skill(""), ["c d"] = skill("") }, "")
+  eq(#items, 2)
+  eq(items[1].text, "$a")
+  eq(items[2].text, "$b")
+end)
+
+case("skill_name_drops_the_mention_sigil", function()
+  eq(skill_name("$go-review"), "go-review")
+  eq(skill_name("go-review"), "go-review")
 end)
 
 -- ── builtin plugin_dev skill ──

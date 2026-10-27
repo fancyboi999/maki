@@ -1,7 +1,14 @@
 local LINE_FMT = "%4d | %s"
 local LINE_PAT = "^%s*%d+ | (.*)$"
+local MENTION_SIGIL = "$"
+-- Only these names can be mentioned. They need no escaping in a regex, and
+-- ending on a word character is what lets `\b` close the mention.
+local MENTIONABLE = "^[%w_][%w_-]*$"
+local MENTIONABLE_END = "[%w_]$"
 
 local M = {}
+
+M.MENTION_SIGIL = MENTION_SIGIL
 
 function M.parse_frontmatter(content)
   local rest = content:match("^%s*%-%-%-\n(.*)")
@@ -64,6 +71,55 @@ function M.parse_output(output)
     end
   end
   return location, table.concat(lines, "\n")
+end
+
+local function mentionable_names(skills)
+  local names = {}
+  for name in pairs(skills) do
+    if type(name) == "string" and name:match(MENTIONABLE) and name:match(MENTIONABLE_END) then
+      names[#names + 1] = name
+    end
+  end
+  table.sort(names)
+  return names
+end
+
+-- `\B` keeps `cost$go` plain. Longer names go first because the regex takes
+-- the first alternative that matches, and `$go-review` must not stop at `go`.
+-- Without lookahead `-` still ends a word, so `$go-x` marks `$go` when no
+-- skill is named `go-x`.
+function M.mention_pattern(skills)
+  local names = mentionable_names(skills)
+  if #names == 0 then
+    return nil
+  end
+  table.sort(names, function(a, b)
+    if #a ~= #b then
+      return #a > #b
+    end
+    return a < b
+  end)
+  return [[\B\$(?:]] .. table.concat(names, "|") .. [[)\b]]
+end
+
+-- A model may pass the name the way the user mentioned it.
+function M.skill_name(name)
+  if name:sub(1, #MENTION_SIGIL) == MENTION_SIGIL then
+    return name:sub(#MENTION_SIGIL + 1)
+  end
+  return name
+end
+
+function M.mention_items(skills, query)
+  local items = {}
+  for _, found in ipairs(maki.text.fuzzy_list(query, mentionable_names(skills))) do
+    items[#items + 1] = {
+      text = MENTION_SIGIL .. found.text,
+      label = skills[found.text].description,
+      score = found.score,
+    }
+  end
+  return items
 end
 
 return M

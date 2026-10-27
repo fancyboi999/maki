@@ -1,3 +1,5 @@
 [permissions]
 fs_read = true
 fs_write = true
+# The `$` completion source sees what the user types after it.
+session_read = true
