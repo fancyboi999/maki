@@ -6,7 +6,7 @@ build *ARGS:
 
 # Types only, no codegen, no lints. Add `-p <crate>` to make it cheaper still.
 check *ARGS:
-    cargo check --workspace --tests --features maki-ui/bench {{ARGS}}
+    cargo check --workspace --all-targets --features maki-ui/bench {{ARGS}}
 
 run *ARGS:
     cargo run {{ARGS}}
@@ -18,7 +18,7 @@ test *ARGS:
     cargo nextest run --workspace {{ARGS}}
 
 lint:
-    cargo clippy --all --tests --features maki-ui/bench -- -D warnings
+    cargo clippy --all --all-targets --features maki-ui/bench -- -D warnings
 
 # Narrow it down, e.g. `just bench -p maki-ui --bench input`.
 bench *ARGS:
