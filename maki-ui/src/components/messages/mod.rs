@@ -341,11 +341,7 @@ impl MessagesPanel {
         if event.backgrounded {
             msg.render_snapshot = None;
             if msg.background.is_none() {
-                msg.background = Some(BackgroundBadge {
-                    id: event.id.clone(),
-                    started_at: Some(Instant::now()),
-                    outcome: None,
-                });
+                msg.background = Some(BackgroundBadge::moved(&event));
             }
         }
         truncate_to_header(&mut msg.text);
@@ -402,6 +398,20 @@ impl MessagesPanel {
                 badge.outcome = Some(outcome);
             }
         });
+    }
+
+    pub fn has_background_badge(&self, tool_id: &str) -> bool {
+        self.messages
+            .iter()
+            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
+            .is_some_and(|m| m.background.is_some())
+    }
+
+    pub fn background_badges(&self) -> Vec<BackgroundBadge> {
+        self.messages
+            .iter()
+            .filter_map(|m| m.background.clone())
+            .collect()
     }
 
     /// A copy of the tool's row, for a task tab that shows the same call.

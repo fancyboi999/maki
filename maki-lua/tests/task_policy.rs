@@ -6,11 +6,12 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use maki_agent::agent::tool_dispatch;
 use maki_agent::tools::test_support::{stub_ctx, stub_ctx_with, stub_seed};
-use maki_agent::tools::{ToolContext, ToolExecResult, ToolRegistry};
+use maki_agent::tools::{CallOrigin, ToolContext, ToolRegistry};
 use maki_agent::{
     AgentEvent, AgentMode, AgentSeed, BufferSnapshot, CallScope, CancelToken, Envelope,
-    EventSender, SessionMailbox, SharedBuf, ToolOutput,
+    EventSender, SessionMailbox, SharedBuf, ToolDoneEvent, ToolOutput,
 };
 use maki_lua::{MoveOutcome, PluginHost, UiAction};
 use maki_storage::id::{MakiId, SessionRef};
@@ -106,18 +107,28 @@ local real_semaphore = maki.async.semaphore
 maki.async.semaphore = function(n)
   recorder.sem_size = n
   local sem = real_semaphore(n)
+  local function spied(permit)
+    recorder.acquired = recorder.acquired + 1
+    return {
+      release = function(p)
+        recorder.released = recorder.released + 1
+        return permit:release()
+      end,
+    }
+  end
   return {
+    try_acquire = function(self)
+      local permit = sem:try_acquire()
+      if permit then
+        recorder.acquire_attempts = recorder.acquire_attempts + 1
+        changed()
+        return spied(permit)
+      end
+    end,
     acquire = function(self)
       recorder.acquire_attempts = recorder.acquire_attempts + 1
       changed()
-      local permit = sem:acquire()
-      recorder.acquired = recorder.acquired + 1
-      return {
-        release = function(p)
-          recorder.released = recorder.released + 1
-          return permit:release()
-        end,
-      }
+      return spied(sem:acquire())
     end,
   }
 end
@@ -722,7 +733,7 @@ fn background_without_a_chat_session_runs_blocking() {
 
 struct LiveChat {
     id: MakiId,
-    _mailbox: SessionMailbox,
+    mailbox: SessionMailbox,
     _seed: Arc<AgentSeed>,
 }
 
@@ -733,7 +744,7 @@ impl LiveChat {
         let seed = mailbox.publish_seed(stub_seed(id));
         Self {
             id,
-            _mailbox: mailbox,
+            mailbox,
             _seed: seed,
         }
     }
@@ -744,7 +755,7 @@ impl LiveChat {
 struct ModelCall {
     id: &'static str,
     events: flume::Receiver<Envelope>,
-    result: flume::Receiver<ToolExecResult>,
+    result: flume::Receiver<ToolDoneEvent>,
 }
 
 impl ModelCall {
@@ -765,17 +776,13 @@ impl ModelCall {
         ctx.cancel = scope.cancel().clone();
         ctx.call = Some(scope);
         ctx.session_id = Some(SessionRef::from(chat.id));
+        ctx.mailbox = Some(chat.mailbox.clone());
         ctx.registry = Arc::clone(reg);
         let (result_tx, result) = flume::bounded(1);
-        let reg = Arc::clone(reg);
         thread::spawn(move || {
-            let invocation = reg
-                .get(TASK_TOOL)
-                .unwrap()
-                .tool
-                .parse(&input)
-                .expect("parse failed");
-            let _ = result_tx.send(smol::block_on(invocation.execute(&ctx)));
+            let done =
+                tool_dispatch::run(id.to_owned(), TASK_TOOL, &input, &ctx, CallOrigin::Model);
+            let _ = result_tx.send(smol::block_on(done));
         });
         Self { id, events, result }
     }
@@ -807,7 +814,7 @@ impl ModelCall {
         })
     }
 
-    fn finish(&self) -> ToolExecResult {
+    fn finish(&self) -> ToolDoneEvent {
         self.result
             .recv_timeout(EVENT_WAIT)
             .expect("task call never replied")
@@ -818,11 +825,10 @@ fn buf_text(buf: &SharedBuf) -> String {
     BufferSnapshot::from_arc(buf.read()).text()
 }
 
-fn reply_text(result: ToolExecResult) -> String {
-    match result.output.expect("task call failed") {
-        ToolOutput::Plain(s) | ToolOutput::Markdown(s) => s.text,
-        other => panic!("unexpected output: {other:?}"),
-    }
+fn reply_text(done: ToolDoneEvent) -> String {
+    let text = done.output.as_text();
+    assert!(!done.is_error, "task call failed: {text}");
+    text
 }
 
 fn request_move(host: &PluginHost, id: &str) -> MoveOutcome {

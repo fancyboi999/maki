@@ -187,6 +187,9 @@ pub struct Agent<'h> {
     model_policy: Arc<ModelPolicy>,
     model_sync: Option<Arc<ArcSwap<ModelSlot>>>,
     stop_continuations: u32,
+    /// The last tool round moved a call to the background. Its receipt tells
+    /// the model to end the turn, so an empty reply after it is no stall.
+    moved_last_round: bool,
 }
 
 impl<'h> Agent<'h> {
@@ -234,6 +237,7 @@ impl<'h> Agent<'h> {
             model_policy: params.model_policy,
             model_sync: None,
             stop_continuations: 0,
+            moved_last_round: false,
         }
     }
 
@@ -308,6 +312,7 @@ impl<'h> Agent<'h> {
         self.rollback_len = self.history.len();
         self.carry_from = self.history.len();
         self.stop_continuations = 0;
+        self.moved_last_round = false;
         self.mode = mode;
         self.workflow = workflow;
         self.opts = RequestOptions { thinking, fast };
@@ -641,7 +646,7 @@ impl<'h> Agent<'h> {
 
         if has_tools {
             let history_len_before = self.history.len();
-            self.process_tool_calls(response).await?;
+            self.moved_last_round = self.process_tool_calls(response).await?;
             self.gauge
                 .append(&self.history.as_slice()[history_len_before..]);
         } else {
@@ -927,7 +932,9 @@ impl<'h> Agent<'h> {
     /// place in history. Returns true when the model was nudged to try again.
     fn recover_stalled_turn(&mut self) -> Result<bool, AgentError> {
         let nudges = self.history.recent_nudges();
-        let nudge = nudges < MAX_NUDGES && self.history.has_recent_tool_results(RECENT_TOOL_WINDOW);
+        let nudge = !self.moved_last_round
+            && nudges < MAX_NUDGES
+            && self.history.has_recent_tool_results(RECENT_TOOL_WINDOW);
         self.history.push(Message::empty_marker());
         if !nudge {
             return Ok(false);
@@ -943,8 +950,8 @@ impl<'h> Agent<'h> {
     }
 
     /// Fails closed: the filter is the frame's, and without one no tool may
-    /// run under some other set.
-    async fn process_tool_calls(&mut self, response: StreamResponse) -> Result<(), AgentError> {
+    /// run under some other set. `true` when a call moved to the background.
+    async fn process_tool_calls(&mut self, response: StreamResponse) -> Result<bool, AgentError> {
         let filter = self
             .history
             .live_frame()
@@ -977,6 +984,7 @@ impl<'h> Agent<'h> {
             instruction_files: self.instruction_files.clone(),
             call_instructions: CallInstructions::default(),
             call: None,
+            mailbox: self.mailbox.clone(),
             cancel: self.cancel.clone(),
             mcp: self.mcp.clone(),
             deadline: Deadline::default(),
@@ -1202,7 +1210,9 @@ fn interrupt_message(message: String, images: Vec<ImageSource>) -> Message {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
     use std::collections::{BTreeMap, VecDeque};
+    use std::mem;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 
@@ -1229,8 +1239,14 @@ mod tests {
     use crate::session::StoredSession;
     use crate::template::Vars;
     use crate::tools::RequestTools;
-    use crate::{EarlierInput, Envelope};
+    use crate::tools::{
+        DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, MovedCall, ParseError, Tool,
+        ToolExecResult, ToolInvocation, ToolRegistry, ToolSource,
+    };
+    use crate::{EarlierInput, Envelope, ToolOutput};
 
+    const MOVING_TOOL: &str = "moving_probe";
+    const MOVING_RECEIPT: &str = "Moved to the background. End your turn.";
     const QUEUED_MESSAGES: [&str; 3] = ["first", "second", "third"];
     const RESPONSE_TEXT: &str = "response";
     const PLAN_ENDED: &str = "Plan mode ended. You may edit files again.";
@@ -1994,7 +2010,7 @@ mod tests {
 
     impl InterruptSource for NotifyOnce {
         fn poll(&self) -> Option<ExtractedCommand> {
-            if std::mem::take(&mut *self.armed.lock().unwrap()) {
+            if mem::take(&mut *self.armed.lock().unwrap()) {
                 SessionMailbox::notify(
                     self.session,
                     NOTICE_BODY.into(),
@@ -3882,6 +3898,77 @@ mod tests {
                 .filter(|e| matches!(e.event, AgentEvent::Nudge))
                 .count();
             assert_eq!(nudges, MAX_NUDGES as usize + 1);
+        });
+    }
+
+    /// Answers every call with a receipt, as `bash(background = true)` does.
+    struct MovingTool;
+
+    struct MovingInvocation;
+
+    impl ToolInvocation for MovingInvocation {
+        fn start_header(&self) -> HeaderFuture {
+            HeaderFuture::Ready(HeaderResult::plain(MOVING_TOOL.into()))
+        }
+        fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
+            Box::pin(async {
+                ToolExecResult {
+                    moved: Some(MovedCall {
+                        result: Box::pin(async { None }),
+                        land: Box::new(drop),
+                    }),
+                    ..Ok(ToolOutput::Plain(MOVING_RECEIPT.into())).into()
+                }
+            })
+        }
+    }
+
+    impl Tool for MovingTool {
+        fn name(&self) -> &str {
+            MOVING_TOOL
+        }
+        fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+            MOVING_TOOL.into()
+        }
+        fn schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+        fn parse(&self, _input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            Ok(Box::new(MovingInvocation))
+        }
+    }
+
+    /// The receipt tells the model to end its turn, so a reply with only
+    /// thinking after it is the answer asked for, not a stall to nudge.
+    #[test_case(MOVING_TOOL, 0 ; "no_nudge_after_a_moved_call")]
+    #[test_case("glob", 1 ; "nudge_after_a_call_that_stayed")]
+    fn nudge_after_a_tool_round(tool: &str, expected_nudges: usize) {
+        smol::block_on(async {
+            let responses = vec![
+                tool_call_response(tool, "t1"),
+                thinking_response(),
+                text_response(StopReason::EndTurn),
+            ];
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+            let registry = ToolRegistry::new();
+            registry
+                .register(
+                    Arc::new(MovingTool),
+                    ToolSource::Lua {
+                        plugin: MOVING_TOOL.into(),
+                    },
+                )
+                .unwrap();
+            agent.registry = Arc::new(registry);
+            let _ = agent.run(default_input()).await;
+            drop(agent);
+
+            let nudges = drain_events(&event_rx)
+                .iter()
+                .filter(|e| matches!(e.event, AgentEvent::Nudge))
+                .count();
+            assert_eq!(nudges, expected_nudges);
         });
     }
 

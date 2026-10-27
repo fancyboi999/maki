@@ -5,9 +5,10 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use maki_agent::agent::tool_dispatch;
 use maki_agent::cancel::{CancelToken, CancelTrigger};
 use maki_agent::tools::test_support::{stub_ctx, stub_ctx_with, stub_seed};
-use maki_agent::tools::{ToolContext, ToolExecResult, ToolRegistry};
+use maki_agent::tools::{CallOrigin, ToolContext, ToolExecResult, ToolRegistry};
 use maki_agent::{
     AgentEvent, AgentMode, AgentSeed, BufferSnapshot, CallScope, Envelope, EventSender,
     SessionMailbox, SpanStyle, ToolDoneEvent, ToolOutput,
@@ -1489,7 +1490,7 @@ struct MovableBatch {
 }
 
 impl MovableBatch {
-    fn start(tool_calls: Value) -> (Self, JoinHandle<ToolExecResult>) {
+    fn start(tool_calls: Value) -> (Self, JoinHandle<ToolDoneEvent>) {
         let (reg, host) = load_batch_host_with(MOVABLE_CHILD_SRC);
         host.ui_attachment().attach();
         let ui = host.ui_action_rx();
@@ -1507,16 +1508,17 @@ impl MovableBatch {
         ctx.cancel = scope.cancel().clone();
         ctx.call = Some(scope);
         ctx.session_id = Some(SessionRef::from(chat));
-        let batch_reg = Arc::clone(&reg);
+        ctx.mailbox = Some(mailbox.clone());
+        ctx.registry = Arc::clone(&reg);
         let call = std::thread::spawn(move || {
             let input = batch_input(tool_calls);
-            let inv = batch_reg
-                .get(BATCH_TOOL)
-                .unwrap()
-                .tool
-                .parse(&input)
-                .unwrap();
-            smol::block_on(inv.execute(&ctx))
+            smol::block_on(tool_dispatch::run(
+                BATCH_ID.to_owned(),
+                BATCH_TOOL,
+                &input,
+                &ctx,
+                CallOrigin::Model,
+            ))
         });
         let body = recv_live_buf(&events);
         let batch = Self {
@@ -1594,13 +1596,14 @@ fn batch_declines_naming_a_running_child_without_a_hook() {
     batch.release("b");
     let result = call.join().expect("batch thread");
     assert!(!result.backgrounded);
+    assert!(!result.is_error);
     let expected = format!(
         "{}{}{}",
         section(HOOKED_TOOL, "hooked:a"),
         section(EDIT_TOOL, "edit:b"),
         summary_all_ok(2)
     );
-    assert_eq!(output_text(result.output.expect("batch failed")), expected);
+    assert_eq!(result.output.as_text(), expected);
     assert!(batch.mailbox.drain().is_empty());
 }
 
@@ -1623,7 +1626,7 @@ fn batch_moves_with_finished_results_inline_and_replies_with_the_late_children()
 
     let result = call.join().expect("batch thread");
     assert!(result.backgrounded);
-    let receipt = output_text(result.output.expect("receipt"));
+    let receipt = result.output.as_text();
     let inline = format!(
         "{}{}{MOVED_HEADER}\n- {HOOKED_TOOL}: late",
         section(OK_TOOL, "ok:a"),
@@ -1667,7 +1670,7 @@ fn batch_moves_once_the_blocking_child_finished() {
 
     let result = call.join().expect("batch thread");
     assert!(result.backgrounded);
-    let receipt = output_text(result.output.expect("receipt"));
+    let receipt = result.output.as_text();
     let inline = format!(
         "{}{MOVED_HEADER}\n- {HOOKED_TOOL}: a",
         section(EDIT_TOOL, "edit:b")

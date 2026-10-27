@@ -90,24 +90,19 @@ Runner.allow_background = opts.allow_background
 Runner.schema = schema
 
 local semaphore = maki.async.semaphore(opts.max_concurrent)
-local slots_held = 0
 
--- The host semaphore cannot say whether a slot is free, so permits are counted
--- here. {on_wait} runs only when every slot is taken, right before the call
--- parks for one.
+-- {on_wait} runs only when every slot is taken, right before the call parks
+-- for one.
 Runner.semaphore = {
   acquire = function(_, on_wait)
-    if slots_held >= opts.max_concurrent and on_wait then
+    local permit = semaphore:try_acquire()
+    if permit then
+      return permit
+    end
+    if on_wait then
       on_wait()
     end
-    local permit = semaphore:acquire()
-    slots_held = slots_held + 1
-    return {
-      release = function()
-        permit:release()
-        slots_held = slots_held - 1
-      end,
-    }
+    return semaphore:acquire()
   end,
 }
 

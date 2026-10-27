@@ -11,23 +11,30 @@ use maki_agent::tools::{
 use maki_agent::{AgentEvent, AgentSeed};
 use maki_config::{AgentConfig, ToolOutputLines};
 use maki_storage::id::SessionRef;
-use mlua::{LuaSerdeExt, MultiValue, Table, UserData, UserDataMethods, Value as LuaValue};
+use mlua::{
+    Function, LuaSerdeExt, MultiValue, Table, UserData, UserDataMethods, Value as LuaValue,
+};
 
 use crate::api::tool::ToolCallReply;
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::{TableExt, json_to_lua};
 use crate::api::util::pair::{Pair, err_pair, pair};
-use crate::runtime::{MoveOutcome, RestoreReason, TaskHandle, active_task, lock_cell, move_self};
+use crate::runtime::{
+    MoveOutcome, RestoreReason, SUBAGENT_SELF_MOVE_MSG, TaskHandle, active_task, lock_cell,
+    move_self,
+};
 
 const DEADLINE_ALREADY_SET_MSG: &str = "ctx:set_deadline() already called";
 const WRITE_TOOL: &str = "write";
 const BACKGROUND_HOOK_ALREADY_SET_MSG: &str = "ctx:on_background() already called";
 const NOT_A_MODEL_CALL_MSG: &str =
     "on_background: only the handler of a model's tool call can move to the background";
+/// Model-facing: bash and task quote it when `background = true` cannot be
+/// honoured.
+const NESTED_CALL_MSG: &str = "background is ignored for a call inside batch or another \
+     tool; call the tool directly to run it in the background";
 const NO_BACKGROUND_HOOK_MSG: &str = "set_movable: call ctx:on_background() first";
 const NO_BACKGROUND_HOOK_FOR_MOVE_MSG: &str = "background: call ctx:on_background() first";
-const SUBAGENT_CALL_MSG: &str =
-    "background: a subagent's tool calls cannot move, its own call in the chat can";
 const EXPIRE_BACKGROUND: &str = "background";
 const EXPIRE_TIMEOUT: &str = "timeout";
 
@@ -76,10 +83,10 @@ fn announce_movable(handle: &TaskHandle, agent: &AgentContext, movable: bool) {
     }
 }
 
-/// What the runtime asks before a move: a subagent's result would land in
-/// its parent's mailbox, and a call needs a live chat to land in.
+/// What the runtime asks before a move: a run to report to, and a live chat
+/// whose task tabs show the work.
 fn could_move(agent: &AgentContext) -> bool {
-    agent.task_id.is_none()
+    agent.mailbox.is_some()
         && agent
             .session_id
             .as_ref()
@@ -396,7 +403,7 @@ impl UserData for LuaCtx {
 
         methods.add_method(
             "on_background",
-            |lua, this, hook: mlua::Function| -> mlua::Result<Pair<bool>> {
+            |lua, this, hook: Function| -> mlua::Result<Pair<bool>> {
                 let Some(agent) = this.agent() else {
                     return Ok(this.cap_err_pair("on_background"));
                 };
@@ -447,10 +454,14 @@ impl UserData for LuaCtx {
                 return Ok(this.cap_err_pair("background"));
             };
             if agent.task_id.is_some() {
-                return Ok(err_pair(SUBAGENT_CALL_MSG));
+                return Ok(err_pair(SUBAGENT_SELF_MOVE_MSG));
             }
-            let (Some(call), Some(id)) = (agent.call.clone(), agent.tool_use_id.clone()) else {
+            let Some(call) = agent.call.clone() else {
                 return Ok(err_pair(NOT_A_MODEL_CALL_MSG));
+            };
+            // A nested call shares its parent's scope but has no id of its own.
+            let Some(id) = agent.tool_use_id.clone() else {
+                return Ok(err_pair(NESTED_CALL_MSG));
             };
             // Nothing may hold the ctx borrow across the wait: the hook runs
             // meanwhile and may call ctx methods.

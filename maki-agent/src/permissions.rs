@@ -211,12 +211,16 @@ pub enum PermissionAnswer {
     DenyWithGuidance(String),
     DenyAlwaysProject,
     DenyAlwaysGlobal,
+    /// Nobody can see the prompt, so nobody will ever answer it: the asker
+    /// moved off its turn where no one watches.
+    Unattended,
 }
 
 impl PermissionAnswer {
     pub fn decision_source(&self) -> &'static str {
         match self {
             Self::AllowOnce | Self::Deny | Self::DenyWithGuidance(_) => DECISION_SOURCE_USER_ONCE,
+            Self::Unattended => DECISION_SOURCE_USER_ABORT,
             Self::AllowSession => DECISION_SOURCE_USER_SESSION,
             Self::AllowAlwaysProject
             | Self::AllowAlwaysGlobal
@@ -245,6 +249,7 @@ impl PermissionAnswer {
             Self::DenyWithGuidance(g) => format!("deny:{g}"),
             Self::DenyAlwaysProject => "deny_always_project".to_string(),
             Self::DenyAlwaysGlobal => "deny_always_global".to_string(),
+            Self::Unattended => "unattended".to_string(),
         }
     }
 
@@ -257,6 +262,7 @@ impl PermissionAnswer {
             "deny" => Some(Self::Deny),
             "deny_always_project" => Some(Self::DenyAlwaysProject),
             "deny_always_global" => Some(Self::DenyAlwaysGlobal),
+            "unattended" => Some(Self::Unattended),
             _ if s.starts_with("deny:") => {
                 let guidance = s.strip_prefix("deny:").unwrap();
                 if guidance.is_empty() {
@@ -696,7 +702,8 @@ impl PermissionManager {
         match answer {
             PermissionAnswer::AllowOnce
             | PermissionAnswer::Deny
-            | PermissionAnswer::DenyWithGuidance(_) => {}
+            | PermissionAnswer::DenyWithGuidance(_)
+            | PermissionAnswer::Unattended => {}
             PermissionAnswer::AllowSession => {
                 for s in &resolved {
                     self.add_session_rule(PermissionRule {
@@ -858,7 +865,16 @@ impl PermissionManager {
             ));
         };
 
-        let guard = rx.lock().await;
+        // A call moved to the background can stay parked on its ask across
+        // turns, so waiting for the channel must end with ours.
+        let Ok(guard) = cancel.race(rx.lock()).await else {
+            return Err(deny(
+                DECISION_SOURCE_USER_ABORT,
+                PROMPT_UNANSWERED_REASON.to_owned(),
+                None,
+                None,
+            ));
+        };
         let refs: Vec<&str> = ps.iter().map(|s| s.as_str()).collect();
         let (t2, s2) = match check(&pt, &refs, force_prompt) {
             PermissionCheck::Allowed => return allowed(by_rule()),
@@ -914,6 +930,14 @@ impl PermissionManager {
         };
         drop(guard);
 
+        if answer == PermissionAnswer::Unattended {
+            return Err(deny(
+                DECISION_SOURCE_USER_ABORT,
+                UNATTENDED_REASON.to_owned(),
+                None,
+                None,
+            ));
+        }
         self.apply_decision(&t2, &s2, &answer);
         let source = answer.decision_source();
         if answer.is_allow() {
@@ -1217,6 +1241,34 @@ mod tests {
 
         assert_eq!(err.reason, UNATTENDED_REASON);
         assert!(events.is_empty(), "no prompt may go out");
+    }
+
+    /// The asker moved where nobody watches, so whoever dropped its prompt
+    /// answers that nobody will, and the call needs an allow rule instead.
+    #[test]
+    fn an_unattended_answer_denies_like_a_missing_channel() {
+        let (event_tx, _events) = flume::unbounded();
+        let (answer_tx, answer_rx) = flume::unbounded();
+        let answers = smol::lock::Mutex::new(answer_rx);
+        answer_tx
+            .send(TaggedAnswer::new(TAGGED_REQUEST_ID, PermissionAnswer::Unattended).encode())
+            .unwrap();
+
+        let err = smol::block_on(default_mgr().enforce(
+            &ToolKey::native(BASH_TOOL),
+            &PermissionScopes::single("cargo test".to_owned()),
+            None,
+            &EventSender::new(event_tx, 0),
+            Some(&answers),
+            TAGGED_REQUEST_ID,
+            &CancelToken::none(),
+            None,
+            None,
+            None,
+        ))
+        .unwrap_err();
+
+        assert_eq!(err.reason, UNATTENDED_REASON);
     }
 
     fn plugin_edit_rule(scope: &str, effect: Effect) -> PermissionRule {
@@ -1733,6 +1785,7 @@ mod tests {
             PermissionAnswer::AllowAlwaysProject,
             PermissionAnswer::Deny,
             PermissionAnswer::DenyWithGuidance("hint".into()),
+            PermissionAnswer::Unattended,
         ] {
             assert_eq!(PermissionAnswer::decode(&a.encode()), Some(a));
         }

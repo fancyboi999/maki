@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 
 use arc_swap::ArcSwap;
+use event_listener::Event;
 use maki_config::ModelPolicy;
 use maki_providers::{Message, RequestOptions, Timeouts};
 use maki_storage::id::{MakiId, SessionRef};
@@ -18,6 +19,11 @@ pub const BACKGROUND_PLAN_WRITE_DENIED: &str =
     "the chat is in plan mode, so background sessions can't change files";
 const MAILBOX_CAPACITY: usize = 100;
 const NOTICE_DISPLAY_MAX_BYTES: usize = 256;
+const NOTICE_HEAD: &str = "Background";
+/// A lost notice knows only the receipt's id, so it names no tool.
+const LOST_TOOL: &str = "task";
+const LOST_NOTICE_TAIL: &str = " ended without reporting back: maki exited or reloaded, or this \
+     session was forked from the one it ran in. Its result is lost.";
 /// Nobody listens on an unattended context's events, so its run id is never read.
 const UNATTENDED_RUN_ID: u64 = 0;
 
@@ -32,12 +38,170 @@ static LIVE_SESSIONS: LazyLock<Mutex<HashMap<MakiId, Weak<LiveSession>>>> =
 struct LiveSession {
     mailbox: Mutex<Mailbox>,
     seed: Mutex<Weak<AgentSeed>>,
+    /// Fires on every change a [`SessionMailbox::next_wake`] waiter waits for.
+    changed: Event,
 }
 
+/// Besides the notices, it tracks every background receipt the model holds
+/// until the answer to it is in a run's history: [`Self::outstanding`] while
+/// the work runs, then the tag of its queued notice. Whatever is unsettled
+/// when the process ends is what the session meta keeps, so a resumed model
+/// learns the result is lost instead of waiting for it.
 #[derive(Default)]
 struct Mailbox {
-    pending: VecDeque<Message>,
+    pending: VecDeque<Notice>,
     wake: bool,
+    outstanding: Vec<String>,
+    /// No run reads it again, so it takes no new receipts.
+    closed: bool,
+}
+
+struct Notice {
+    message: Message,
+    /// The receipt this answers. A queued notice is not settled yet: only a
+    /// run that drains it puts the answer where the model reads it.
+    settles: Option<String>,
+}
+
+/// The result of a background task, for the run that holds its receipt.
+pub struct BackgroundNotice<'a> {
+    pub text: String,
+    pub display: Option<&'a str>,
+    pub wake: bool,
+}
+
+impl Mailbox {
+    /// A full mailbox drops its oldest untagged notice. A tagged one is never
+    /// dropped: it is a result the model holds a receipt for, and nothing
+    /// would report it lost. Receipts bound those anyway.
+    fn push(&mut self, message: Message, settles: Option<String>, wake: bool) {
+        if self.pending.len() >= MAILBOX_CAPACITY
+            && let Some(evicted) = self
+                .pending
+                .iter()
+                .position(|notice| notice.settles.is_none())
+        {
+            self.pending.remove(evicted);
+        }
+        self.pending.push_back(Notice { message, settles });
+        self.wake |= wake;
+    }
+
+    fn take(&mut self) -> Vec<Message> {
+        self.wake = false;
+        self.pending
+            .drain(..)
+            .map(|notice| notice.message)
+            .collect()
+    }
+
+    fn queued_tags(&self) -> impl Iterator<Item = &String> {
+        self.pending
+            .iter()
+            .filter_map(|notice| notice.settles.as_ref())
+    }
+
+    /// Answers `id` with a quiet notice that its result is lost. It stays
+    /// unsettled until a run drains it, so quitting before that keeps it.
+    fn push_lost(&mut self, id: &str) {
+        let text = format!("{NOTICE_HEAD} {LOST_TOOL} {id}{LOST_NOTICE_TAIL}");
+        let display = format!("{NOTICE_HEAD} {LOST_TOOL} {}: {id}", TaskEnd::Lost.word());
+        self.push(
+            observation(text, Some(&display)),
+            Some(id.to_owned()),
+            false,
+        );
+    }
+
+    fn is_unsettled(&self, id: &str) -> bool {
+        self.outstanding
+            .iter()
+            .chain(self.queued_tags())
+            .any(|tracked| tracked == id)
+    }
+}
+
+/// How a background task ended, as the notice that settled its receipt tells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskEnd {
+    Finished,
+    Failed,
+    /// Stopped by the user or `task_stop`. Only the transcript line says so:
+    /// the model reads `finished` or `failed`, and the output names the stop.
+    Cancelled,
+    Lost,
+}
+
+impl TaskEnd {
+    const ALL: [Self; 4] = [Self::Finished, Self::Failed, Self::Cancelled, Self::Lost];
+
+    fn word(self) -> &'static str {
+        match self {
+            Self::Finished => "finished",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Lost => "lost",
+        }
+    }
+}
+
+/// The notice a moved call's final result becomes: the text the model reads
+/// and the line the transcript shows.
+pub fn result_notice(
+    tool: &str,
+    id: &str,
+    summary: &str,
+    failed: bool,
+    stopped: bool,
+    output: &str,
+) -> (String, String) {
+    let read = if failed {
+        TaskEnd::Failed
+    } else {
+        TaskEnd::Finished
+    };
+    let shown = if stopped { TaskEnd::Cancelled } else { read };
+    (
+        format!(
+            "{NOTICE_HEAD} {tool} {id} ({summary}) {}:\n\n{output}",
+            read.word()
+        ),
+        format!("{NOTICE_HEAD} {tool} {}: {summary}", shown.word()),
+    )
+}
+
+/// The receipt a stored notice settled and how its task ended, read back
+/// from the words [`result_notice`] and a lost notice write, so a session
+/// saved by an older build tells it too.
+pub fn settled_by(message: &Message) -> Option<(&str, TaskEnd)> {
+    if !message.is_observation() {
+        return None;
+    }
+    let (tool, rest) = split_notice_head(message.first_text_content()?)?;
+    let (shown_tool, shown) = split_notice_head(message.display_text.as_deref()?)?;
+    let (word, _) = shown.split_once(':')?;
+    let end = TaskEnd::ALL.into_iter().find(|end| end.word() == word)?;
+    let id = rest.split_once(' ').map_or(rest, |(id, _)| id);
+    (tool == shown_tool).then_some((id, end))
+}
+
+/// `Background <tool> <rest>` as `(tool, rest)`.
+fn split_notice_head(text: &str) -> Option<(&str, &str)> {
+    text.strip_prefix(NOTICE_HEAD)?
+        .strip_prefix(' ')?
+        .split_once(' ')
+}
+
+/// How a receipt names the task its call moved to, which is also how a
+/// stored receipt is told from any other result.
+pub fn receipt_tag(id: &str) -> String {
+    format!("(task {id})")
+}
+
+fn observation(text: String, display: Option<&str>) -> Message {
+    let mut message = Message::observation(text);
+    message.display_text = display.and_then(notice_label);
+    message
 }
 
 #[derive(Debug, Error)]
@@ -105,29 +269,27 @@ impl SessionMailbox {
         display: Option<&str>,
         wake: bool,
     ) -> Result<(), MailboxError> {
-        let live = {
-            let mut sessions = lock(&LIVE_SESSIONS);
-            let Some(live) = sessions.get(&session_id).and_then(Weak::upgrade) else {
-                sessions.remove(&session_id);
-                return Err(MailboxError(session_id));
-            };
-            live
-        };
-        let mut message = Message::observation(text);
-        message.display_text = display.and_then(notice_label);
-        let mut mailbox = lock(&live.mailbox);
-        if mailbox.pending.len() == MAILBOX_CAPACITY {
-            mailbox.pending.pop_front();
-        }
-        mailbox.pending.push_back(message);
-        mailbox.wake |= wake;
+        let mailbox = Self::open(session_id)?;
+        mailbox.change(|state| state.push(observation(text, display), None, wake));
         Ok(())
     }
 
+    /// The mailbox of a live session, never a new one.
+    pub fn open(session_id: MakiId) -> Result<Self, MailboxError> {
+        let mut sessions = lock(&LIVE_SESSIONS);
+        let Some(live) = sessions.get(&session_id).and_then(Weak::upgrade) else {
+            sessions.remove(&session_id);
+            return Err(MailboxError(session_id));
+        };
+        Ok(Self { session_id, live })
+    }
+
+    pub fn session_id(&self) -> MakiId {
+        self.session_id
+    }
+
     pub fn drain(&self) -> Vec<Message> {
-        let mut mailbox = lock(&self.live.mailbox);
-        mailbox.wake = false;
-        mailbox.pending.drain(..).collect()
+        lock(&self.live.mailbox).take()
     }
 
     pub fn claim_wake(&self) -> Vec<Message> {
@@ -135,8 +297,129 @@ impl SessionMailbox {
         if !mailbox.wake {
             return Vec::new();
         }
-        mailbox.wake = false;
-        mailbox.pending.drain(..).collect()
+        mailbox.take()
+    }
+
+    /// The model holds a receipt for `id` and waits for its result. `false`
+    /// once [`Self::close`]d: nobody would read the result.
+    pub fn track(&self, id: &str) -> bool {
+        self.change(|state| {
+            if !state.closed && !state.outstanding.iter().any(|known| known == id) {
+                state.outstanding.push(id.to_owned());
+            }
+            !state.closed
+        })
+    }
+
+    pub fn close(&self) {
+        lock(&self.live.mailbox).closed = true;
+    }
+
+    /// The work behind `id` ended. `None` when the model already has the
+    /// answer (its own stop waited for it). A notice for a receipt nobody
+    /// tracks is dropped, so a result never answers a call the model no
+    /// longer made.
+    pub fn settle(&self, id: &str, notice: Option<BackgroundNotice<'_>>) {
+        self.change(|state| {
+            let Some(index) = state.outstanding.iter().position(|tracked| tracked == id) else {
+                tracing::debug!(id, "result of a background task nobody waits for");
+                return;
+            };
+            state.outstanding.swap_remove(index);
+            if let Some(notice) = notice {
+                let message = observation(notice.text, notice.display);
+                state.push(message, Some(id.to_owned()), notice.wake);
+            }
+        });
+    }
+
+    /// The receipt for `id` left the history (a rewind): nothing may answer it.
+    pub fn forget(&self, id: &str) {
+        self.change(|state| {
+            state.outstanding.retain(|tracked| tracked != id);
+            state
+                .pending
+                .retain(|notice| notice.settles.as_deref() != Some(id));
+            state.wake &= !state.pending.is_empty();
+        });
+    }
+
+    /// Every receipt whose answer is not in a run's history yet.
+    pub fn unsettled(&self) -> Vec<String> {
+        let mailbox = lock(&self.live.mailbox);
+        mailbox
+            .outstanding
+            .iter()
+            .chain(mailbox.queued_tags())
+            .cloned()
+            .collect()
+    }
+
+    /// Background work still running for this mailbox's receipts.
+    pub fn outstanding(&self) -> usize {
+        lock(&self.live.mailbox).outstanding.len()
+    }
+
+    /// The receipts a stored session left unsettled, each answered with a
+    /// quiet notice that its result is lost. One this process still tracks is
+    /// skipped: its work runs here, or [`Self::lose`] already answered it.
+    pub fn restore_lost(&self, ids: &[String]) {
+        self.change(|state| {
+            for id in ids {
+                if !state.is_unsettled(id) {
+                    state.push_lost(id);
+                }
+            }
+        });
+    }
+
+    /// The work behind `id` died without a result, with the plugin host that
+    /// ran it (`/reload`, exit). Nothing else would ever settle it.
+    pub fn lose(&self, id: &str) {
+        self.change(|state| {
+            let Some(index) = state.outstanding.iter().position(|tracked| tracked == id) else {
+                return;
+            };
+            state.outstanding.swap_remove(index);
+            state.push_lost(id);
+        });
+    }
+
+    /// The notices of the next wake, waiting for one while background work
+    /// is outstanding. `None` once nothing is out and nothing woke: quiet
+    /// notices stay queued for whatever run comes next.
+    pub async fn next_wake(&self) -> Option<Vec<Message>> {
+        self.wait_for_wake(false).await
+    }
+
+    /// [`Self::next_wake`] for an agent whose caller waits on its answer.
+    /// Once nothing is out, no later run of it would read a quiet notice,
+    /// like the cut output of a call the user stopped, so that is its last
+    /// wake.
+    pub async fn next_wake_before_answer(&self) -> Option<Vec<Message>> {
+        self.wait_for_wake(true).await
+    }
+
+    async fn wait_for_wake(&self, take_quiet: bool) -> Option<Vec<Message>> {
+        loop {
+            let listener = self.live.changed.listen();
+            {
+                let mut mailbox = lock(&self.live.mailbox);
+                if mailbox.wake {
+                    return Some(mailbox.take());
+                }
+                if mailbox.outstanding.is_empty() {
+                    return (take_quiet && !mailbox.pending.is_empty()).then(|| mailbox.take());
+                }
+            }
+            listener.await;
+        }
+    }
+
+    fn change<T>(&self, apply: impl FnOnce(&mut Mailbox) -> T) -> T {
+        let changed = apply(&mut lock(&self.live.mailbox));
+        self.live.changed.notify(usize::MAX);
+        changed
     }
 
     /// The registry only keeps a weak link, so the caller has to hold on to
@@ -270,7 +553,7 @@ mod tests {
     use std::fs;
 
     use futures_lite::future::poll_once;
-    use maki_providers::ThinkingConfig;
+    use maki_providers::{MessageKind, ThinkingConfig};
     use test_case::test_case;
 
     use super::*;
@@ -437,6 +720,237 @@ mod tests {
         SessionMailbox::notify(canonical, "built".into(), None, false).unwrap();
 
         assert_eq!(mailbox.drain().len(), 1);
+    }
+
+    const TASK_ID: &str = "toolu_bg";
+    const OTHER_TASK_ID: &str = "toolu_other";
+
+    fn result(wake: bool) -> Option<BackgroundNotice<'static>> {
+        Some(BackgroundNotice {
+            text: NOTICE_BODY.into(),
+            display: None,
+            wake,
+        })
+    }
+
+    #[test]
+    fn settled_notice_stays_unsettled_until_a_run_drains_it() {
+        let mailbox = SessionMailbox::register(MakiId::generate());
+        mailbox.track(TASK_ID);
+        assert_eq!(mailbox.unsettled(), [TASK_ID]);
+        assert_eq!(mailbox.outstanding(), 1);
+
+        mailbox.settle(TASK_ID, result(true));
+        assert_eq!(mailbox.outstanding(), 0);
+        assert_eq!(mailbox.unsettled(), [TASK_ID]);
+
+        assert_eq!(text(&mailbox.claim_wake()[0]), NOTICE_BODY);
+        assert!(mailbox.unsettled().is_empty());
+    }
+
+    #[test_case(true ; "forgotten")]
+    #[test_case(false ; "never_tracked")]
+    fn settle_drops_the_result_of_an_untracked_receipt(tracked_then_forgotten: bool) {
+        let mailbox = SessionMailbox::register(MakiId::generate());
+        if tracked_then_forgotten {
+            mailbox.track(TASK_ID);
+            mailbox.forget(TASK_ID);
+        }
+
+        mailbox.settle(TASK_ID, result(true));
+
+        assert!(mailbox.drain().is_empty());
+        assert!(mailbox.unsettled().is_empty());
+    }
+
+    #[test]
+    fn settle_without_a_notice_only_untracks() {
+        let mailbox = SessionMailbox::register(MakiId::generate());
+        mailbox.track(TASK_ID);
+
+        mailbox.settle(TASK_ID, None);
+
+        assert!(mailbox.unsettled().is_empty());
+        assert!(mailbox.drain().is_empty());
+    }
+
+    #[test]
+    fn forgetting_the_only_waking_result_leaves_nothing_to_wake_for() {
+        let mailbox = SessionMailbox::register(MakiId::generate());
+        mailbox.track(TASK_ID);
+        mailbox.settle(TASK_ID, result(true));
+
+        mailbox.forget(TASK_ID);
+
+        assert!(mailbox.claim_wake().is_empty());
+        assert!(smol::block_on(mailbox.next_wake()).is_none());
+    }
+
+    #[test]
+    fn a_full_mailbox_drops_untagged_notices_before_results() {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        mailbox.track(TASK_ID);
+        mailbox.settle(TASK_ID, result(false));
+        for index in 0..MAILBOX_CAPACITY {
+            SessionMailbox::notify(id, index.to_string(), None, false).unwrap();
+        }
+
+        assert_eq!(mailbox.unsettled(), [TASK_ID]);
+        assert_eq!(text(&mailbox.drain()[0]), NOTICE_BODY);
+    }
+
+    #[test]
+    fn a_mailbox_full_of_results_keeps_every_one() {
+        let mailbox = SessionMailbox::register(MakiId::generate());
+        let ids: Vec<String> = (0..=MAILBOX_CAPACITY).map(|i| i.to_string()).collect();
+        for id in &ids {
+            mailbox.track(id);
+            mailbox.settle(id, result(false));
+        }
+
+        assert_eq!(mailbox.unsettled(), ids);
+        assert_eq!(mailbox.drain().len(), ids.len());
+    }
+
+    #[test]
+    fn forget_drops_a_queued_result() {
+        let mailbox = SessionMailbox::register(MakiId::generate());
+        mailbox.track(TASK_ID);
+        mailbox.track(OTHER_TASK_ID);
+        mailbox.settle(TASK_ID, result(false));
+        mailbox.settle(OTHER_TASK_ID, result(false));
+
+        mailbox.forget(TASK_ID);
+
+        assert_eq!(mailbox.unsettled(), [OTHER_TASK_ID]);
+        assert_eq!(mailbox.drain().len(), 1);
+    }
+
+    #[test]
+    fn restore_lost_answers_each_stored_receipt_once_and_skips_live_ones() {
+        let mailbox = SessionMailbox::register(MakiId::generate());
+        mailbox.track(TASK_ID);
+        let stored = [TASK_ID.to_owned(), OTHER_TASK_ID.to_owned()];
+
+        mailbox.restore_lost(&stored);
+        mailbox.restore_lost(&stored);
+
+        assert_eq!(mailbox.unsettled(), [TASK_ID, OTHER_TASK_ID]);
+        assert!(
+            mailbox.claim_wake().is_empty(),
+            "a lost notice must not wake"
+        );
+        let lost = mailbox.drain();
+        assert_eq!(lost.len(), 1);
+        assert!(text(&lost[0]).contains(OTHER_TASK_ID));
+        assert!(text(&lost[0]).ends_with(LOST_NOTICE_TAIL));
+        assert_eq!(mailbox.unsettled(), [TASK_ID]);
+    }
+
+    #[test]
+    fn lose_answers_outstanding_work_once_and_quietly() {
+        let mailbox = SessionMailbox::register(MakiId::generate());
+        mailbox.track(TASK_ID);
+
+        mailbox.lose(TASK_ID);
+        mailbox.lose(TASK_ID);
+        mailbox.lose(OTHER_TASK_ID);
+        mailbox.restore_lost(&[TASK_ID.to_owned()]);
+
+        assert_eq!(mailbox.outstanding(), 0);
+        assert_eq!(mailbox.unsettled(), [TASK_ID]);
+        assert!(
+            mailbox.claim_wake().is_empty(),
+            "a lost notice must not wake"
+        );
+        let lost = mailbox.drain();
+        assert_eq!(lost.len(), 1);
+        assert!(text(&lost[0]).ends_with(LOST_NOTICE_TAIL));
+    }
+
+    const TOOL: &str = "bash";
+    const SUMMARY: &str = "Run the (slow) tests: all of them";
+    const OTHER_TOOL_LINE: &str = "Background task finished: x";
+
+    #[test_case(false, false, TaskEnd::Finished ; "finished")]
+    #[test_case(true,  false, TaskEnd::Failed   ; "failed")]
+    #[test_case(true,  true,  TaskEnd::Cancelled ; "stopped")]
+    fn settled_by_reads_back_a_result_notice(failed: bool, stopped: bool, end: TaskEnd) {
+        let (text, display) = result_notice(TOOL, TASK_ID, SUMMARY, failed, stopped, NOTICE_BODY);
+
+        let notice = observation(text, Some(&display));
+
+        assert_eq!(settled_by(&notice), Some((TASK_ID, end)));
+    }
+
+    #[test]
+    fn settled_by_reads_back_a_lost_notice() {
+        let mailbox = SessionMailbox::register(MakiId::generate());
+        mailbox.restore_lost(&[TASK_ID.to_owned()]);
+
+        assert_eq!(
+            settled_by(&mailbox.drain()[0]),
+            Some((TASK_ID, TaskEnd::Lost))
+        );
+    }
+
+    #[test_case(|m: &mut Message| m.kind = MessageKind::Turn ; "a_user_turn")]
+    #[test_case(|m: &mut Message| m.display_text = None      ; "no_transcript_line")]
+    #[test_case(|m: &mut Message| m.display_text = Some(OTHER_TOOL_LINE.into()) ; "another_tool")]
+    fn settled_by_ignores(alter: fn(&mut Message)) {
+        let (text, display) = result_notice(TOOL, TASK_ID, SUMMARY, false, false, NOTICE_BODY);
+        let mut message = observation(text, Some(&display));
+
+        alter(&mut message);
+
+        assert_eq!(settled_by(&message), None);
+    }
+
+    #[test]
+    fn next_wake_waits_while_work_is_outstanding() {
+        let mailbox = SessionMailbox::register(MakiId::generate());
+        smol::block_on(async {
+            SessionMailbox::notify(mailbox.session_id(), "quiet".into(), None, false).unwrap();
+            assert!(mailbox.next_wake().await.is_none());
+
+            mailbox.track(TASK_ID);
+            let mut wake = Box::pin(mailbox.next_wake());
+            assert!(poll_once(&mut wake).await.is_none());
+
+            mailbox.settle(TASK_ID, result(true));
+            let woken = wake.await.unwrap();
+            assert_eq!(
+                woken.iter().map(text).collect::<Vec<_>>(),
+                ["quiet", NOTICE_BODY]
+            );
+            assert!(mailbox.next_wake().await.is_none());
+        });
+    }
+
+    #[test]
+    fn next_wake_before_answer_takes_a_quiet_last_result() {
+        let mailbox = SessionMailbox::register(MakiId::generate());
+        smol::block_on(async {
+            mailbox.track(TASK_ID);
+            let mut wake = Box::pin(mailbox.next_wake_before_answer());
+            assert!(poll_once(&mut wake).await.is_none());
+
+            mailbox.settle(TASK_ID, result(false));
+            let woken = wake.await.unwrap();
+            assert_eq!(woken.iter().map(text).collect::<Vec<_>>(), [NOTICE_BODY]);
+            assert!(mailbox.next_wake_before_answer().await.is_none());
+        });
+    }
+
+    #[test]
+    fn open_never_creates_a_mailbox() {
+        let id = MakiId::generate();
+        assert!(SessionMailbox::open(id).is_err());
+        let registered = SessionMailbox::register(id);
+        assert_eq!(SessionMailbox::open(id).unwrap().session_id(), id);
+        drop(registered);
+        assert!(SessionMailbox::open(id).is_err());
     }
 
     #[test]

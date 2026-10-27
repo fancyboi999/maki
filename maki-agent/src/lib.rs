@@ -32,7 +32,10 @@ pub use agent::{
 };
 pub use call_scope::{AlreadyMoved, CallGuard, CallScope, SessionStub, TaskHome};
 pub use cancel::{CancelHandle, CancelMap, CancelToken, CancelTrigger};
-pub use live_session::{AgentSeed, MailboxError, SessionMailbox};
+pub use live_session::{
+    AgentSeed, BackgroundNotice, MailboxError, SessionMailbox, TaskEnd, receipt_tag, result_notice,
+    settled_by,
+};
 pub use maki_config::{AgentConfig, PermissionsConfig, SessionDefaults, ToolOutputLines};
 pub mod command;
 pub mod diff;
@@ -50,11 +53,11 @@ pub use maki_providers::AgentError;
 use maki_providers::Message;
 pub use maki_providers::{EMPTY_RESPONSE_MARKER, ImageMediaType, ImageSource, ThinkingConfig};
 pub use types::{
-    AgentEvent, BufferSnapshot, CallRecord, DoneReason, Envelope, EventSender, EventStreamGuard,
-    GrepFileEntry, GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND, RunLedger,
-    RunTotals, SessionEndReason, SessionEvents, SharedBuf, SnapshotLine, SnapshotSpan, SpanColor,
-    SpanStyle, SteerKind, SubagentInfo, TextOutput, ToolDoneEvent, ToolInput, ToolOutput,
-    ToolStartEvent, TurnCompleteEvent, UiWaker, event_stream,
+    AgentEvent, BufferSnapshot, CallRecord, CostTally, DoneReason, Envelope, EventSender,
+    EventStreamGuard, GrepFileEntry, GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND,
+    RunLedger, RunTotals, SessionEndReason, SessionEvents, SharedBuf, SnapshotLine, SnapshotSpan,
+    SpanColor, SpanStyle, SteerKind, SubagentInfo, TextOutput, ToolDoneEvent, ToolInput,
+    ToolOutput, ToolStartEvent, TurnCompleteEvent, UiWaker, event_stream,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

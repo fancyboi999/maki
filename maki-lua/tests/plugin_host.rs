@@ -259,6 +259,8 @@ const NIL_WITHOUT_JOBS_ERR: &str =
 const FINISH_CALLED_TWICE_ERR: &str = "ctx:finish() already called";
 const DEADLINE_ALREADY_SET_ERR: &str = "ctx:set_deadline() already called";
 const TIMED_OUT_SUBSTR: &str = "timed out";
+const PARKED_PAST_DEADLINE_TOOL: &str = "parked_past_deadline";
+const PARKED_PAST_DEADLINE_ERR: &str = "tool parked_past_deadline timed out after 0s";
 const ALREADY_CALLED_ERR: &str = "already called";
 const UNKNOWN_FIELD_ERR: &str = "unknown field";
 const PERMISSION_DENIED_MSG: &str = "permission denied";
@@ -5358,6 +5360,32 @@ fn ctx_set_deadline_times_out() {
     host.load_source("deadline_test", &src).unwrap();
     let err = exec_tool(&reg, "deadline_test", serde_json::json!({})).unwrap_err();
     assert!(err.contains(TIMED_OUT_SUBSTR), "got: {err}");
+}
+
+/// No cancel hook is set up yet to word the reply, so it reads the way the
+/// dispatch loop words a timeout.
+#[test]
+fn a_handler_parked_past_its_deadline_times_out() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "{PARKED_PAST_DEADLINE_TOOL}",
+            description = "parks past its deadline",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                ctx:set_deadline(0)
+                maki.async.await(1, function(_) end)
+                return "should-not-reach"
+            end
+        }})"#,
+    );
+    host.load_source(PARKED_PAST_DEADLINE_TOOL, &src).unwrap();
+
+    let err = exec_tool(&reg, PARKED_PAST_DEADLINE_TOOL, json!({})).unwrap_err();
+
+    assert_eq!(err, PARKED_PAST_DEADLINE_ERR);
 }
 
 #[test]

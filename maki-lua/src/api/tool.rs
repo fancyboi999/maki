@@ -14,13 +14,13 @@ use maki_agent::tools::Tool;
 use maki_agent::tools::registry::{RegisteredTool, ToolRegistry};
 use maki_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, validate};
 use maki_agent::tools::{
-    BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
+    BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, MovedCall, ParseError,
     PermissionScopes, ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation,
     ToolReach, is_tool_enabled, timeout_annotation,
 };
 use maki_agent::{
     AgentEvent, BufferSnapshot, CallScope, ImageMediaType, ImageSource, SharedBuf, TextOutput,
-    ToolDoneEvent, ToolOutput,
+    ToolOutput,
 };
 use maki_config::{Effect, PermissionRule, ToolKey, ToolOutputLines};
 use maki_lua_macro::{lua_fn, lua_table};
@@ -1777,8 +1777,9 @@ pub(crate) struct ToolCallReply {
     /// return. It becomes `ToolOutput::Image` with `llm_output` as caption.
     pub image: Option<ImageSource>,
     pub state: Option<Value>,
-    /// `result` is the receipt of a call that moved to the background.
-    pub backgrounded: bool,
+    /// Set when `result` is the receipt of a call that moved to the
+    /// background.
+    pub moved: Option<MovedCall>,
 }
 
 impl ToolCallReply {
@@ -1791,7 +1792,7 @@ impl ToolCallReply {
             diff,
             image,
             state,
-            backgrounded,
+            moved,
             ..
         } = self;
         let output = result.map(|s| {
@@ -1819,27 +1820,7 @@ impl ToolCallReply {
             output,
             annotation,
             written_path,
-            backgrounded,
-        }
-    }
-
-    /// What dispatch would have made of the reply, for the final reply of a
-    /// moved call, which no dispatcher waits for any more.
-    pub(crate) fn into_done_event(self, id: String, tool: Arc<str>) -> ToolDoneEvent {
-        let result = self.into_exec_result();
-        let (output, is_error) = match result.output {
-            Ok(output) => (output, false),
-            Err(message) => (ToolOutput::Plain(message.into()), true),
-        };
-        ToolDoneEvent {
-            id,
-            tool,
-            output: Arc::new(output),
-            is_error,
-            annotation: result.annotation,
-            written_path: result.written_path,
-            call: None,
-            backgrounded: false,
+            moved,
         }
     }
 
@@ -1887,7 +1868,7 @@ impl ToolCallReply {
             diff,
             image,
             state,
-            backgrounded: false,
+            moved: None,
         }
     }
 
@@ -1920,7 +1901,7 @@ impl ToolCallReply {
             diff: None,
             image: None,
             state: None,
-            backgrounded: false,
+            moved: None,
         }
     }
 

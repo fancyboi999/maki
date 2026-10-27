@@ -9,11 +9,12 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use maki_agent::agent::tool_dispatch;
 use maki_agent::tools::test_support::stub_seed;
-use maki_agent::tools::{ToolOutputMode, ToolRegistry};
+use maki_agent::tools::{CallOrigin, ToolOutputMode, ToolRegistry};
 use maki_agent::{
     AgentEvent, AgentSeed, CallScope, CancelToken, CancelTrigger, Envelope, EventSender,
-    SessionMailbox, SharedBuf, ToolOutput,
+    SessionMailbox, SharedBuf,
 };
 use maki_config::{PluginFileConfig, PluginsConfig};
 use maki_lua::{EventHandle, MoveOutcome, PluginHost};
@@ -21,14 +22,14 @@ use maki_storage::id::MakiId;
 use maki_storage::paths::{session_task_logs_dir, state_dir};
 use serde_json::{Value, json};
 use tempfile::TempDir;
+use test_case::test_case;
 
 const WAIT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const GATE_FILE: &str = "go";
 const GATE_POLL_SECS: &str = "0.02";
 const RECEIPT_HEAD: &str = "Running in the background.";
-const PROGRESS_LABEL: &str = "Full output (read it to check progress): ";
-const FINAL_LABEL: &str = "Full output: ";
+const LOG_LABEL: &str = "Full output: ";
 const ROTATED_SUFFIX: &str = ".1";
 const LOG_CAP_BYTES: u64 = 2048;
 const TAIL_LINES: usize = 5;
@@ -42,6 +43,9 @@ const TIMED_OUT_MARKER: &str = "timed out after 5s";
 /// live buf, so the marker is computed by the shell and never spelled out in it.
 const READY_COMMAND: &str = "echo ready-$((40+2))";
 const READY_LINE: &str = "ready-42";
+const FAILING_COMMAND: &str = "exit 3";
+const DESCRIPTION: &str = "Check the build";
+const TIMEOUT_ANNOTATION: &str = "5s timeout";
 
 fn poll_until<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
     let deadline = Instant::now() + WAIT;
@@ -83,13 +87,6 @@ fn gated_command(gate_file: &Path, before: &str, after: &str) -> String {
         "{before}; while [ ! -e '{}' ]; do sleep {GATE_POLL_SECS}; done; {after}",
         gate_file.display()
     )
-}
-
-fn plain_text(output: ToolOutput) -> String {
-    match output {
-        ToolOutput::Plain(s) | ToolOutput::Markdown(s) => s.text,
-        other => panic!("unexpected output: {other:?}"),
-    }
 }
 
 /// One bash call in a live chat, executing on its own thread so the test can
@@ -149,6 +146,7 @@ impl Run {
         let tool = tool.to_owned();
         let thread = thread::spawn({
             let seed = Arc::clone(&seed);
+            let mailbox = mailbox.clone();
             let call_id = call_id.clone();
             move || {
                 let (reg, host) = builtins_host(&opts);
@@ -156,8 +154,9 @@ impl Run {
                 let scope = Arc::new(CallScope::new(call_id.clone(), &run_token));
                 let mut ctx = seed.tool_context(scope.cancel().clone());
                 ctx.event_tx = EventSender::new(events_tx, 0);
-                ctx.tool_use_id = Some(call_id);
+                ctx.tool_use_id = Some(call_id.clone());
                 ctx.call = Some(scope);
+                ctx.mailbox = Some(mailbox);
                 ctx.output_mode = ToolOutputMode::Compact;
                 ctx.config.rtk = false;
                 ctx.registry = Arc::clone(&reg);
@@ -166,14 +165,17 @@ impl Run {
                 if !ctx.permissions.is_yolo() {
                     ctx.permissions.toggle_yolo();
                 }
-                let inv = reg
-                    .get(&tool)
-                    .unwrap_or_else(|| panic!("{tool} registered"))
-                    .tool
-                    .parse(&input)
-                    .expect("parse failed");
-                let result = smol::block_on(inv.execute(&ctx)).output.map(plain_text);
-                result_tx.send(result).ok();
+                let done = smol::block_on(tool_dispatch::run(
+                    call_id,
+                    &tool,
+                    &input,
+                    &ctx,
+                    CallOrigin::Model,
+                ));
+                let text = done.output.as_text();
+                result_tx
+                    .send(if done.is_error { Err(text) } else { Ok(text) })
+                    .ok();
                 // The final reply is delivered by the host, which has to
                 // outlive the call.
                 finished.recv().ok();
@@ -265,7 +267,7 @@ impl Drop for Run {
 }
 
 fn progress_line(run: &Run) -> String {
-    format!("{PROGRESS_LABEL}{}", run.log_path().display())
+    format!("{LOG_LABEL}{}", run.log_path().display())
 }
 
 #[test]
@@ -308,7 +310,7 @@ fn log_keeps_growing_after_the_move_and_the_final_reply_names_it() {
         "{notice}"
     );
     assert!(
-        notice.contains(&format!("{FINAL_LABEL}{}", run.log_path().display())),
+        notice.contains(&format!("{LOG_LABEL}{}", run.log_path().display())),
         "{notice}"
     );
     assert_eq!(
@@ -400,7 +402,7 @@ fn a_bash_in_a_moved_batch_logs_the_output_it_prints_after_the_move() {
 
     let logs = session_task_logs_dir(&state_dir().unwrap(), run.session);
     let log_path = notice
-        .split_once(FINAL_LABEL)
+        .split_once(LOG_LABEL)
         .and_then(|(_, rest)| rest.lines().next())
         .unwrap_or_else(|| panic!("no log path in {notice}"));
     assert!(Path::new(log_path).starts_with(&logs), "{log_path}");
@@ -437,4 +439,52 @@ fn a_timeout_moves_the_command_when_background_on_timeout_is_set() {
     let notice = run.final_notice();
     assert!(notice.contains("finished-late"), "{notice}");
     assert_eq!(run.log(), "started\nfinished-late\n");
+}
+
+/// The timeout sits beside the header as an annotation, so the summary that
+/// names the call in `/tasks`, a rewind and a background notice is the label
+/// alone.
+#[test]
+fn the_timeout_annotates_the_header_and_stays_out_of_the_summary() {
+    let input = json!({ "command": "true", "description": DESCRIPTION, "timeout": TIMEOUT_SECS });
+    let run = Run::launch(
+        isolated_state(),
+        json!({}),
+        BASH_TOOL,
+        input,
+        TempDir::new().unwrap(),
+    );
+
+    let start = poll_until("bash never started", || {
+        run.events.try_iter().find_map(|env| match env.event {
+            AgentEvent::ToolStart(start) => Some(start),
+            _ => None,
+        })
+    });
+
+    assert_eq!(start.summary, DESCRIPTION);
+    assert_eq!(start.annotation.as_deref(), Some(TIMEOUT_ANNOTATION));
+}
+
+/// The UI repeats an error reply under a view that lacks the reply's last
+/// line, so the view of a moved command must end on the log line its final
+/// reply ends on, or a stopped or failed command shows its output twice.
+#[test_case(false ; "failed")]
+#[test_case(true ; "stopped")]
+fn the_view_ends_on_the_line_the_final_reply_ends_on(stop: bool) {
+    let mut run = Run::start(json!({}), None, READY_COMMAND, FAILING_COMMAND);
+    run.wait_for_output(READY_LINE);
+    run.move_to_background();
+
+    if stop {
+        run.handle.cancel_plugin_session(&run.call_id);
+    } else {
+        run.release();
+    }
+    let notice = run.final_notice();
+
+    let log_line = format!("{LOG_LABEL}{}", run.log_path().display());
+    assert_eq!(notice.lines().last(), Some(log_line.as_str()), "{notice}");
+    let view = run.live.as_ref().expect("the live buf").take().text();
+    assert_eq!(view.lines().last(), Some(log_line.as_str()), "{view}");
 }

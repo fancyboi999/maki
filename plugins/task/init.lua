@@ -59,8 +59,8 @@ local function handler(input, ctx)
   -- A background task moves before it waits for a slot, so the model's turn
   -- does not wait with it. The move keeps waiting where it is and still holds
   -- a slot once it gets one. A blocking task has no hook until it holds one.
-  -- Moving fails without a live chat (headless, -p, SDK, ACP), and then the
-  -- task simply runs blocking.
+  -- Moving fails where background work is off (a zero --background-timeout),
+  -- and then the task simply runs blocking.
   local foreground_note
   local run_in_background = Runner.allow_background and input.background == true
   if run_in_background then

@@ -5,12 +5,13 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use maki_agent::agent::tool_dispatch;
 use maki_agent::cancel::{CancelToken, CancelTrigger};
 use maki_agent::tools::test_support::{stub_ctx, stub_ctx_with, stub_seed};
-use maki_agent::tools::{ToolContext, ToolExecResult, ToolRegistry};
+use maki_agent::tools::{CallOrigin, ToolContext, ToolRegistry};
 use maki_agent::{
     AgentEvent, AgentMode, AgentSeed, CallScope, CancelMap, Envelope, EventSender, SessionMailbox,
-    ToolDoneEvent, ToolOutput,
+    ToolDoneEvent,
 };
 use maki_lua::{MoveOutcome, PluginHost, UiAction};
 use maki_providers::provider::{BoxFuture, Provider};
@@ -170,7 +171,7 @@ impl Host {
 
     /// The `ui_id` of every session the plugin opened so far.
     fn opened(&self) -> String {
-        let (out, failed) = text(exec(&self.reg, OPENED, &stub_ctx(&AgentMode::Build)));
+        let (out, failed) = text(&exec(&self.reg, OPENED, &stub_ctx(&AgentMode::Build)));
         assert!(!failed, "{out}");
         out
     }
@@ -215,7 +216,7 @@ impl Chat {
 
 struct Running {
     events: flume::Receiver<Envelope>,
-    call: JoinHandle<ToolExecResult>,
+    call: JoinHandle<ToolDoneEvent>,
     run: CancelTrigger,
     /// The run's `subagent_cancels`, which run end drains.
     cancels: Arc<CancelMap<String>>,
@@ -236,6 +237,7 @@ impl Running {
         ctx.cancel = scope.cancel().clone();
         ctx.call = Some(scope);
         ctx.session_id = Some(SessionRef::from(chat));
+        ctx.mailbox = SessionMailbox::open(chat).ok();
         ctx.registry = Arc::clone(&host.reg);
         ctx.provider = Arc::clone(&parked.provider);
         let cancels = Arc::clone(&ctx.subagent_cancels);
@@ -251,17 +253,24 @@ impl Running {
     }
 }
 
-fn exec(reg: &ToolRegistry, name: &str, ctx: &ToolContext) -> ToolExecResult {
-    let inv = reg.get(name).unwrap().tool.parse(&json!({})).unwrap();
-    smol::block_on(inv.execute(ctx))
+/// Through dispatch, the one path that lands a moved call's final reply.
+fn exec(reg: &Arc<ToolRegistry>, name: &str, ctx: &ToolContext) -> ToolDoneEvent {
+    let ctx = ToolContext {
+        registry: Arc::clone(reg),
+        ..ctx.clone()
+    };
+    let id = ctx.tool_use_id.clone().unwrap_or_default();
+    smol::block_on(tool_dispatch::run(
+        id,
+        name,
+        &json!({}),
+        &ctx,
+        CallOrigin::Model,
+    ))
 }
 
-fn text(result: ToolExecResult) -> (String, bool) {
-    match result.output {
-        Ok(ToolOutput::Plain(s) | ToolOutput::Markdown(s)) => (s.text, false),
-        Ok(other) => panic!("unexpected output {other:?}"),
-        Err(error) => (error, true),
-    }
+fn text(done: &ToolDoneEvent) -> (String, bool) {
+    (done.output.as_text(), done.is_error)
 }
 
 fn position(events: &[AgentEvent], matches: impl Fn(&AgentEvent) -> bool) -> Option<usize> {

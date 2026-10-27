@@ -11,12 +11,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use maki_agent::agent::tool_dispatch;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::tools::test_support::{stub_ctx_with, stub_seed};
-use maki_agent::tools::{ToolContext, ToolExecResult, ToolRegistry};
+use maki_agent::tools::{CallOrigin, ToolContext, ToolRegistry};
 use maki_agent::{
     AgentEvent, AgentMode, AgentSeed, CallScope, CancelToken, Envelope, EventSender,
-    PermissionsConfig, SessionMailbox, ToolDoneEvent, ToolOutput,
+    PermissionsConfig, SessionMailbox, ToolDoneEvent,
 };
 use maki_config::ProjectConfig;
 #[cfg(unix)]
@@ -39,6 +40,7 @@ const GUARDED_PLUGIN: &str = "guarded_tool_test";
 const MOVER_PLUGIN: &str = "self_mover_test";
 const TASK_TOOL: &str = "task";
 const MOVER_TOOL: &str = "self_mover";
+const DEADLINE_MOVER_TOOL: &str = "deadline_mover";
 const CALL_ID: &str = "toolu_background_task";
 const SECOND_CALL_ID: &str = "toolu_background_task_second";
 const GUARDED_CALL_ID: &str = "toolu_guarded";
@@ -59,6 +61,14 @@ const MOVED_AS_ASKED: &str = "Started in the background as asked";
 const FOREGROUND_NOTE_HEAD: &str = "Could not start in the background (";
 const FOREGROUND_NOTE_TAIL: &str = "Ran in the foreground.";
 const AGENT_DENIED: &str = "permission denied: 'agent' not granted";
+const TIMED_OUT: &str = "timed out after";
+const SUBAGENT_SELF_MOVE: &str =
+    "background: a subagent's tool call only moves when the user moves it";
+const SUBAGENT_TASK_ID: &str = "toolu_subagent";
+const NESTED_CALL: &str = "background is ignored for a call inside batch or another tool; \
+     call the tool directly to run it in the background";
+const NO_LIVE_CHAT: &str = "no live chat";
+const BACKGROUND_OFF: &str = "background tasks are turned off here (--background-timeout 0)";
 
 #[cfg(unix)]
 const STATE_ENV_VARS: [&str; 2] = ["HOME", "XDG_STATE_HOME"];
@@ -67,7 +77,7 @@ const BASH_TOOL: &str = "bash";
 #[cfg(unix)]
 const BASH_RECEIPT: &str = "Running in the background.";
 #[cfg(unix)]
-const BASH_PROGRESS_LABEL: &str = "Full output (read it to check progress): ";
+const BASH_PROGRESS_LABEL: &str = "Full output: ";
 #[cfg(unix)]
 const BASH_FINAL_LINE: &str = "finished-late";
 #[cfg(unix)]
@@ -102,6 +112,19 @@ maki.api.register_tool({
     end)
     local ok, err = ctx:background()
     return tostring(ok) .. ": " .. tostring(err)
+  end,
+})
+maki.api.register_tool({
+  name = "deadline_mover",
+  description = "moves itself when its deadline passes",
+  schema = { type = "object", properties = {} },
+  audiences = { "main" },
+  handler = function(_, ctx)
+    ctx:on_background(function()
+      return "mover moved"
+    end)
+    ctx:set_deadline(0, { expire = "background" })
+    maki.async.await(1, function() end)
   end,
 })
 "#;
@@ -315,6 +338,7 @@ fn call_ctx_as(
     ctx.cancel = scope.cancel().clone();
     ctx.call = Some(scope);
     ctx.session_id = Some(SessionRef::from(chat));
+    ctx.mailbox = SessionMailbox::open(chat).ok();
     ctx.registry = Arc::clone(reg);
     (ctx, events)
 }
@@ -345,17 +369,20 @@ fn task_input() -> Value {
     json!({ "description": NAME, "prompt": PROMPT, "background": true })
 }
 
-fn exec(reg: &ToolRegistry, name: &str, input: Value, ctx: &ToolContext) -> ToolExecResult {
-    let inv = reg.get(name).unwrap().tool.parse(&input).unwrap();
-    smol::block_on(inv.execute(ctx))
-}
-
-fn text(result: ToolExecResult) -> (String, bool) {
-    match result.output {
-        Ok(ToolOutput::Plain(s) | ToolOutput::Markdown(s)) => (s.text, false),
-        Ok(other) => panic!("unexpected output {other:?}"),
-        Err(error) => (error, true),
-    }
+/// Through dispatch, the one path that lands a moved call's final reply.
+fn exec(reg: &Arc<ToolRegistry>, name: &str, input: Value, ctx: &ToolContext) -> ToolDoneEvent {
+    let ctx = ToolContext {
+        registry: Arc::clone(reg),
+        ..ctx.clone()
+    };
+    let id = ctx.tool_use_id.clone().unwrap_or_default();
+    smol::block_on(tool_dispatch::run(
+        id,
+        name,
+        &input,
+        &ctx,
+        CallOrigin::Model,
+    ))
 }
 
 fn done_text(done: &ToolDoneEvent) -> (String, bool) {
@@ -376,7 +403,7 @@ fn a_background_task_returns_a_receipt_and_its_reply_arrives_as_the_notice() {
     let result = exec(&host.reg, TASK_TOOL, task_input(), &ctx);
 
     assert!(result.backgrounded);
-    let (receipt, failed) = text(result);
+    let (receipt, failed) = done_text(&result);
     assert!(!failed, "{receipt}");
     assert!(receipt.starts_with(MOVED_RECEIPT), "{receipt}");
     assert!(receipt.contains(MOVED_AS_ASKED), "{receipt}");
@@ -407,7 +434,7 @@ fn a_background_task_without_a_live_chat_runs_blocking() {
 
     let result = call.join().expect("call thread");
     assert!(!result.backgrounded);
-    let (reply, failed) = text(result);
+    let (reply, failed) = done_text(&result);
     assert!(!failed, "{reply}");
     assert!(reply.starts_with(FOREGROUND_NOTE_HEAD), "{reply}");
     assert!(reply.contains(FOREGROUND_NOTE_TAIL), "{reply}");
@@ -443,7 +470,7 @@ fn a_background_task_waiting_for_a_slot_returns_its_receipt_at_once() {
     waiter.join().expect("waiter thread");
 
     assert!(result.backgrounded);
-    let (receipt, failed) = text(result);
+    let (receipt, failed) = done_text(&result);
     assert!(!failed, "{receipt}");
     assert!(receipt.starts_with(MOVED_RECEIPT), "{receipt}");
     assert!(parked.started.try_recv().is_err(), "the slot is still held");
@@ -499,7 +526,7 @@ fn ctx_background_needs_the_agent_permission(agent: bool) {
     let result = exec(&host.reg, MOVER_TOOL, json!({}), &ctx);
 
     assert_eq!(result.backgrounded, agent);
-    let (reply, failed) = text(result);
+    let (reply, failed) = done_text(&result);
     assert!(!failed, "{reply}");
     if agent {
         assert!(reply.starts_with(MOVER_RECEIPT), "{reply}");
@@ -511,6 +538,81 @@ fn ctx_background_needs_the_agent_permission(agent: bool) {
         assert!(reply.contains(AGENT_DENIED), "{reply}");
         assert!(chat.mailbox.drain().is_empty());
     }
+}
+
+/// A deadline that expires to the background is a self-move all the same.
+#[test_case(true ; "with_agent_it_moves")]
+#[test_case(false ; "without_agent_it_times_out")]
+fn a_background_deadline_needs_the_agent_permission(agent: bool) {
+    let host = Host::mover(agent);
+    let chat = Chat::live();
+    let (_run, run_token) = CancelToken::new();
+    let (ctx, _events) = call_ctx(&host.reg, chat.id, &run_token);
+
+    let result = exec(&host.reg, DEADLINE_MOVER_TOOL, json!({}), &ctx);
+
+    assert_eq!(result.backgrounded, agent);
+    let (reply, failed) = done_text(&result);
+    if agent {
+        assert!(reply.starts_with(MOVER_RECEIPT), "{reply}");
+    } else {
+        assert!(failed && reply.contains(TIMED_OUT), "{reply}");
+        assert!(chat.mailbox.unsettled().is_empty());
+    }
+}
+
+/// A subagent waits for its moved calls, so only the user moves one.
+#[test]
+fn ctx_background_refuses_a_subagents_call() {
+    let host = Host::mover(true);
+    let chat = Chat::live();
+    let subagent = SessionMailbox::register(MakiId::generate());
+    let (_run, run_token) = CancelToken::new();
+    let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token);
+    ctx.task_id = Some(Arc::from(SUBAGENT_TASK_ID));
+    ctx.mailbox = Some(subagent.clone());
+
+    let result = exec(&host.reg, MOVER_TOOL, json!({}), &ctx);
+
+    assert!(!result.backgrounded);
+    assert_eq!(
+        done_text(&result),
+        (format!("nil: {SUBAGENT_SELF_MOVE}"), false)
+    );
+    assert!(subagent.unsettled().is_empty());
+}
+
+/// A call nested in batch shares the batch's scope but has no id of its own,
+/// and the model has to learn to make it a direct call instead.
+#[test]
+fn ctx_background_refuses_a_call_nested_in_another_tool() {
+    let host = Host::mover(true);
+    let chat = Chat::live();
+    let (_run, run_token) = CancelToken::new();
+    let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token);
+    ctx.tool_use_id = None;
+
+    let result = exec(&host.reg, MOVER_TOOL, json!({}), &ctx);
+
+    assert!(!result.backgrounded);
+    assert_eq!(done_text(&result), (format!("nil: {NESTED_CALL}"), false));
+}
+
+/// A session that is up without a seed runs with background work off, which
+/// the model must not read as a missing chat.
+#[test_case(false, NO_LIVE_CHAT ; "no_live_chat")]
+#[test_case(true, BACKGROUND_OFF ; "background_off")]
+fn ctx_background_without_a_seed_names_the_cause(session_up: bool, reason: &str) {
+    let host = Host::mover(true);
+    let chat = MakiId::generate();
+    let _mailbox = session_up.then(|| SessionMailbox::register(chat));
+    let (_run, run_token) = CancelToken::new();
+    let (ctx, _events) = call_ctx(&host.reg, chat, &run_token);
+
+    let result = exec(&host.reg, MOVER_TOOL, json!({}), &ctx);
+
+    assert!(!result.backgrounded);
+    assert_eq!(done_text(&result), (format!("nil: {reason}"), false));
 }
 
 /// Lets the gated command finish whatever happens to the test.
@@ -577,7 +679,7 @@ fn bash_in_the_background_returns_a_receipt_with_the_log_path_at_once() {
     );
 
     assert!(result.backgrounded);
-    let (receipt, failed) = text(result);
+    let (receipt, failed) = done_text(&result);
     assert!(!failed, "{receipt}");
     assert!(receipt.starts_with(BASH_RECEIPT), "{receipt}");
     assert!(

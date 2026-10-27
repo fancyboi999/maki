@@ -95,22 +95,28 @@ impl CallScope {
         }
     }
 
-    /// Detaches the subtree from the run token and hands its trigger to the
-    /// caller, who now decides when the work ends.
+    /// Takes the gate of a move, detaches the subtree from the run token and
+    /// hands the call's trigger to the caller, who now decides when the work
+    /// ends. Detached here rather than at the landing, so the run ending as
+    /// the receipt reaches it finds nothing left to cancel.
     ///
     /// Taking the trigger is the one gate: a second move, or a move after the
     /// call ended and its guard fired, finds it gone. A run token that already
     /// fired has cancelled the call token by the time this returns.
-    pub fn move_to(&self, home: TaskHome) -> Result<CancelTrigger, AlreadyMoved> {
+    pub fn claim_move(&self) -> Result<(MoveClaim<'_>, CancelTrigger), AlreadyMoved> {
         let trigger = self.take_trigger().ok_or(AlreadyMoved)?;
         // In this order a run firing midway reaches the owner either way:
         // directly, or through the call token it now follows.
         self.cancel.adopt(&self.owner);
         self.owner.unlink(&self.run);
         self.cancel.unlink(&self.run);
-        // Only the holder of the trigger sets the home, so this cannot fail.
-        let _ = self.home.set(home);
-        self.moved.notify(usize::MAX);
+        Ok((MoveClaim(self), trigger))
+    }
+
+    /// A move with nothing to do between the claim and the landing.
+    pub fn move_to(&self, home: TaskHome) -> Result<CancelTrigger, AlreadyMoved> {
+        let (claim, trigger) = self.claim_move()?;
+        claim.land(home);
         Ok(trigger)
     }
 
@@ -153,6 +159,21 @@ impl CallScope {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
+    }
+}
+
+/// A move holding the gate that has not landed: the call reads as unmoved.
+/// Its holder does every step that can fail first and lands last, so a move
+/// that gives up never shows as moved. Giving up drops the trigger too, which
+/// ends the call as cancelled.
+#[must_use]
+pub struct MoveClaim<'a>(&'a CallScope);
+
+impl MoveClaim<'_> {
+    pub fn land(self, home: TaskHome) {
+        // Only the holder of the trigger sets the home, so this cannot fail.
+        let _ = self.0.home.set(home);
+        self.0.moved.notify(usize::MAX);
     }
 }
 
@@ -215,6 +236,22 @@ mod tests {
         drop(guard);
         assert!(!scope.cancel().is_cancelled());
 
+        drop(trigger);
+        assert!(scope.cancel().is_cancelled());
+    }
+
+    #[test]
+    fn a_claim_that_never_lands_leaves_the_call_unmoved_and_its_end_to_the_trigger() {
+        let (run_trigger, run) = CancelToken::new();
+        let (scope, guard) = scope_under(&run);
+        let (claim, trigger) = scope.claim_move().unwrap();
+        drop(claim);
+
+        assert!(scope.home().is_none());
+        assert!(matches!(scope.claim_move(), Err(AlreadyMoved)));
+        drop(guard);
+        run_trigger.cancel();
+        assert!(!scope.cancel().is_cancelled());
         drop(trigger);
         assert!(scope.cancel().is_cancelled());
     }

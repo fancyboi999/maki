@@ -66,6 +66,8 @@ const GATE_CLOSED: &str = "the scripted model stopped waiting for its release";
 const RECEIPT_MISSING: &str = "the model's next request carries no result for the moved call";
 const SERIALIZES: &str = "messages serialize";
 const NO_WAKE: &str = "the finished task left no wake for the chat";
+const NOT_IDLE: &str = "check for extra requests only once the loop reported it is idle";
+const EXTRA_REQUEST: &str = "an extra request went out";
 
 // Mirrors of the wording in maki-lua's runtime and registry.
 const MOVED_BY_USER: &str = "Moved to the background by the user";
@@ -436,11 +438,18 @@ impl World {
         self.requests.recv_timeout(WAIT).expect(NO_REQUEST)
     }
 
+    /// The provider records a request before it answers, and `QueueDrained`
+    /// follows the last answer of the loop's last run, so once that event is
+    /// read nothing can still be in flight and `try_recv` is exact. Only the
+    /// event loop starts runs, never this one on its own, so no later run
+    /// needs a point to wait for.
+    #[track_caller]
     fn assert_no_more_requests(&self) {
         assert!(
-            self.requests.try_recv().is_err(),
-            "an extra request went out"
+            matches!(self.seen.last(), Some(AgentEvent::QueueDrained)),
+            "{NOT_IDLE}"
         );
+        assert!(self.requests.try_recv().is_err(), "{EXTRA_REQUEST}");
     }
 
     fn finish_moved_call(&self) {
