@@ -209,7 +209,7 @@ declare maki: {
     action: @checked (name: string) -> (boolean?, string?),
     open_editor: @checked (path: string) -> (number),
     open_win: @checked (buf: any, opts: any) -> (any),
-    set_status_hint: @checked (spans: any) -> (),
+    set_status_hint: @checked (spans: any, opts: any) -> (),
     set_window_title: @checked (title: string) -> (),
     input: @checked () -> (any, string?),
     input_rules: @checked (opts: any) -> (),

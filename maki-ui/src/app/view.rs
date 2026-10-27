@@ -465,18 +465,14 @@ impl App {
     }
 
     fn lua_hint_line(&self) -> Option<Line<'static>> {
-        let snap = self.hints.get()?;
-        if snap.entries.is_empty() {
-            return None;
-        }
-        let mut spans = Vec::new();
-        for (_, pairs) in &snap.entries {
-            for (text, style_name) in pairs {
-                let style = theme::style_by_name(style_name);
-                spans.push(Span::styled(text.clone(), style));
-            }
-        }
-        Some(Line::from(spans))
+        let spans: Vec<_> = self
+            .hints
+            .get()?
+            .visible_in(self.state.session.id)
+            .flat_map(|entry| &entry.spans)
+            .map(|(text, style_name)| Span::styled(text.clone(), theme::style_by_name(style_name)))
+            .collect();
+        (!spans.is_empty()).then(|| Line::from(spans))
     }
 
     #[cfg(test)]

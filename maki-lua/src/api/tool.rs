@@ -43,8 +43,8 @@ use crate::plugin_permissions::{
     MANIFEST_FILE, Permission, PluginPermissions, PluginReach, require,
 };
 use crate::runtime::{
-    HintContent, LiveCtx, PromptHintCallbacks, PromptHintRegistration, PromptTarget, Request,
-    command_depth,
+    HintContent, Lineage, LiveCtx, PromptHintCallbacks, PromptHintRegistration, PromptTarget,
+    Request,
 };
 
 const TOOL_NAME_MAX: usize = 64;
@@ -1014,7 +1014,7 @@ async fn run_command(
     #[ctx] caller: PluginReach,
     cmdline: String,
 ) -> LuaResult<Pair<bool>> {
-    let depth = command_depth(&lua).saturating_add(1);
+    let depth = Lineage::current(&lua).command_depth.saturating_add(1);
     let reply = try_pair!(
         ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::RunCommand {
             cmdline,

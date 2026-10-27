@@ -6,14 +6,15 @@ use maki_agent::UiWaker;
 use maki_agent::tools::compact_duration;
 use maki_highlight::{DEFAULT_COLOR_NAME, SegmentColor};
 use maki_lua_macro::{lua_fn, lua_table};
+use maki_storage::id::{MakiId, MakiIdParseError};
 use mlua::{Lua, Result as LuaResult, Table};
 
 use crate::api::action::run_plugin_action;
 use crate::api::keymap::{InputMode, accept_key, switch_mode};
 use crate::api::util::command::{
-    Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintWriter, InputDecorate,
-    InputEdit, InputMarks, InputRequest, InputSubmit, Split, TextEdit, TitlePos, UiAction,
-    WinCommand, WinEvent, ui_json_roundtrip, ui_roundtrip, ui_send,
+    Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintEntry, HintWriter,
+    InputDecorate, InputEdit, InputMarks, InputRequest, InputSubmit, Split, TextEdit, TitlePos,
+    UiAction, WinCommand, WinEvent, ui_json_roundtrip, ui_roundtrip, ui_send,
 };
 use crate::api::util::convert::{TableExt, reject_unknown_fields, required};
 use crate::api::util::pair::{Pair, err_pair, try_pair};
@@ -26,7 +27,7 @@ pub(crate) mod marks;
 pub(crate) mod syntax;
 pub(crate) mod win;
 
-use crate::runtime::{plugin_loaded, with_task_bufs};
+use crate::runtime::{Lineage, plugin_loaded, with_task_bufs};
 use marks::{InputRule, InputRuleStore, PatternRule, parse_mark, parse_pushed_mark};
 use syntax::parse_syntax;
 use win::{WinHandle, WinSender};
@@ -36,6 +37,9 @@ const UI_STYLE_FIELDS: usize = 8;
 const INPUT_EDIT: &str = "input_edit";
 const INPUT_DECORATE: &str = "input_decorate";
 const INPUT_SUBMIT: &str = "input_submit";
+const OPEN_WIN: &str = "open_win";
+const SET_STATUS_HINT: &str = "set_status_hint";
+const SESSION_OPT: &str = "session";
 const SINGLE_EDIT_KEYS: [&str; 3] = ["start", "stop", "text"];
 const NOT_A_LIST_ERR: &str = "is a list of tables, so wrap a single one in {}";
 const MIXED_EDIT_SHAPES_ERR: &str =
@@ -74,9 +78,15 @@ const SYNTAX_ALONE_ERR: &str =
 const FOCUSED_CLAIM_ERR: &str =
     "a focused window already receives every key, so `keys` belongs to `focus = false` windows";
 
+/// Each plugin gets one slot that shows in every tab, and one more for each
+/// session it names. One plugin serves all the tabs, so without the session
+/// in the key a hint about one chat would show up in all of them.
 pub(crate) struct HintStore {
-    hints: BTreeMap<Arc<str>, Vec<(String, String)>>,
+    hints: BTreeMap<HintSlot, Vec<(String, String)>>,
 }
+
+/// A `None` session shows in every tab.
+type HintSlot = (Arc<str>, Option<MakiId>);
 
 impl HintStore {
     pub fn new() -> Self {
@@ -85,22 +95,37 @@ impl HintStore {
         }
     }
 
-    pub fn set(&mut self, plugin: Arc<str>, spans: Vec<(String, String)>) {
-        if spans.is_empty() {
-            self.hints.remove(&plugin);
-        } else {
-            self.hints.insert(plugin, spans);
+    /// Empty {spans} clear. Without a session they wipe every slot of the
+    /// plugin, so a plain `set_status_hint(nil)` still hides all it shows,
+    /// like it did back when a plugin had only one hint.
+    pub fn set(&mut self, plugin: Arc<str>, session: Option<MakiId>, spans: Vec<(String, String)>) {
+        match (spans.is_empty(), session) {
+            (false, _) => {
+                self.hints.insert((plugin, session), spans);
+            }
+            (true, Some(_)) => {
+                self.hints.remove(&(plugin, session));
+            }
+            (true, None) => self.clear_plugin(&plugin),
         }
     }
 
     pub fn clear_plugin(&mut self, plugin: &str) {
-        self.hints.retain(|k, _| k.as_ref() != plugin);
+        self.hints.retain(|(owner, _), _| owner.as_ref() != plugin);
+    }
+
+    pub fn clear_session(&mut self, session: MakiId) {
+        self.hints.retain(|(_, owner), _| *owner != Some(session));
     }
 
     pub fn snapshot_entries(&self) -> HintEntries {
         self.hints
             .iter()
-            .map(|(k, v)| (Arc::clone(k), v.clone()))
+            .map(|((plugin, session), spans)| HintEntry {
+                plugin: Arc::clone(plugin),
+                session: *session,
+                spans: spans.clone(),
+            })
             .collect()
     }
 }
@@ -136,6 +161,24 @@ impl WinStore {
             tx.send(WinCommand::Close);
         }
     }
+}
+
+/// Hints leave with their session. A tab that moves on to a new chat would
+/// inherit them otherwise, and a closed tab would leave them here for good.
+pub(crate) fn clear_session_hints(lua: &Lua, session: MakiId) {
+    if let Some(mut store) = lua.app_data_mut::<HintStore>() {
+        store.clear_session(session);
+    }
+    publish_hint_snapshot(lua);
+}
+
+fn session_opt(func: &str, opts: &Table) -> LuaResult<Option<MakiId>> {
+    let Some(raw) = opts.opt::<String>(SESSION_OPT)? else {
+        return Ok(None);
+    };
+    raw.parse().map(Some).map_err(|e: MakiIdParseError| {
+        mlua::Error::runtime(format!("{func}: bad {SESSION_OPT} {raw:?}: {e}"))
+    })
 }
 
 fn publish_hint_snapshot(lua: &Lua) {
@@ -1001,6 +1044,10 @@ fn parse_claimed_keys(opts: &Table, focus: bool) -> LuaResult<Vec<Key>> {
 /// Returns a Win handle you can use to receive events, update layout,
 /// and close the window when you are done.
 ///
+/// A window belongs to one session and shows only while that session's tab is
+/// focused. It closes when the session leaves its tab (`/new`, loading another
+/// session, closing the tab), or right away if the session is not in any tab.
+///
 /// @param buf Buf Buffer to display.
 /// @param opts table Float configuration. Fields:
 ///   - width (integer|string): window width. Integer for absolute columns; "N%" for percent of terminal width. Default "60%".
@@ -1023,6 +1070,7 @@ fn parse_claimed_keys(opts: &Table, focus: bool) -> LuaResult<Vec<Key>> {
 ///   - visible (boolean): whether the window is initially visible. Default true. See `win:hide()` for what hiding does.
 ///   - needs_input (boolean): whether the window means the session needs user input. Default false.
 ///   - stack (boolean): offset the window past the other stacked windows sharing its anchor, in open order, with a one row gap. Closing one moves the rest up. Floating windows only. Default false.
+///   - session (string): id of the session that owns the window, e.g. `ev.data.session_id` or `ctx:session_id()`. Default: the session of the running tool call, else the focused tab's. A `maki.async.run` task keeps the tool call's session, a `maki.async.spawn` task does not.
 /// @return (Win) Window handle.
 /// @example
 /// local buf = maki.ui.buf()
@@ -1043,6 +1091,7 @@ fn open_win(
     opts: Table,
 ) -> LuaResult<WinHandle> {
     let buf_handle = buf.borrow::<buf::BufHandle>()?;
+    let session = session_opt(OPEN_WIN, &opts)?.or_else(|| Lineage::current(lua).session);
     let title: String = opts.get("title").unwrap_or_default();
     let cursor_line = opts.opt_bool("cursor_line").unwrap_or(false);
     let footer = parse_footer(&opts)?;
@@ -1116,6 +1165,7 @@ fn open_win(
     let _ = ui_send(
         tx.as_ref(),
         UiAction::OpenWin {
+            session,
             buf: buf_handle.buf.clone(),
             config,
             focus,
@@ -1137,17 +1187,24 @@ fn open_win(
 #[allow(non_upper_case_globals)]
 pub(crate) const set_status_hint__doc: FnDoc = FnDoc {
     name: "set_status_hint",
-    args: "{spans}",
-    desc: "Shows key hints in the status bar for your plugin. Each hint is a {key, label} pair. Pass nil to clear your plugin's hints. Only your own hints are affected, other plugins keep theirs.",
-    params: &[ParamDoc {
-        name: "{spans}",
-        ty: "table|nil",
-        desc: "Sequence of {key, label} pairs, e.g. `{{\"q\", \"quit\"}, {\"j\", \"down\"}}`. Pass nil to remove the plugin's hints.",
-    }],
+    args: "{spans}, {opts?}",
+    desc: "Shows your plugin's key hints in the status bar. Other plugins' hints are not affected. By default the hints show in every tab, even when set from a tool call. With `opts.session` they show only in that session's tab, replacing your every-tab hints there, and are cleared when the session leaves the tab.",
+    params: &[
+        ParamDoc {
+            name: "{spans}",
+            ty: "table|nil",
+            desc: "Sequence of {key, label} pairs, e.g. `{{\"q\", \"quit\"}, {\"j\", \"down\"}}`. nil clears your hints for `opts.session`, or all your hints if `opts.session` is not set.",
+        },
+        ParamDoc {
+            name: "{opts}",
+            ty: "table?",
+            desc: "`session` (string): id of the session whose tab shows the hints, e.g. `ev.data.session_id` or `ctx:session_id()`. Default: every tab.",
+        },
+    ],
     returns: "",
     guard: None,
     value: false,
-    example: "maki.ui.set_status_hint({ {\"q\", \"quit\"}, {\"j\", \"down\"} })\n-- later, clear them:\nmaki.ui.set_status_hint(nil)",
+    example: "maki.ui.set_status_hint({ {\"q\", \"quit\"}, {\"j\", \"down\"} })\n-- later, clear them:\nmaki.ui.set_status_hint(nil)\n\n-- Only in the tab of the session that is running a turn:\nmaki.api.create_autocmd(\"TurnStart\", {\n  callback = function(ev)\n    maki.ui.set_status_hint({ {\"Esc\", \"cancel\"} }, { session = ev.data.session_id })\n  end,\n})\nmaki.api.create_autocmd(\"TurnEnd\", {\n  callback = function(ev)\n    maki.ui.set_status_hint(nil, { session = ev.data.session_id })\n  end,\n})",
 };
 
 lua_table! {
@@ -1371,34 +1428,35 @@ pub(crate) fn create_ui_table(
 
     let p = Arc::clone(&plugin);
     t.set(
-        "set_status_hint",
-        lua.create_function(move |lua, value: mlua::Value| {
-            match value {
-                mlua::Value::Nil => {
-                    if let Some(mut store) = lua.app_data_mut::<HintStore>() {
-                        store.clear_plugin(&p);
-                    }
+        SET_STATUS_HINT,
+        lua.create_function(move |lua, (value, opts): (mlua::Value, Option<Table>)| {
+            let session = match &opts {
+                Some(opts) => {
+                    reject_unknown_fields(opts, &[SESSION_OPT], SET_STATUS_HINT)?;
+                    session_opt(SET_STATUS_HINT, opts)?
                 }
-                mlua::Value::Table(tbl) => {
-                    let spans: Vec<(String, String)> = tbl
-                        .sequence_values::<Table>()
-                        .map(|entry| {
-                            let entry = entry?;
-                            Ok((
-                                entry.get::<String>(1)?,
-                                entry.get::<String>(2).unwrap_or_default(),
-                            ))
-                        })
-                        .collect::<LuaResult<_>>()?;
-                    if let Some(mut store) = lua.app_data_mut::<HintStore>() {
-                        store.set(Arc::clone(&p), spans);
-                    }
-                }
+                None => None,
+            };
+            let spans = match value {
+                mlua::Value::Nil => Vec::new(),
+                mlua::Value::Table(tbl) => tbl
+                    .sequence_values::<Table>()
+                    .map(|entry| {
+                        let entry = entry?;
+                        Ok((
+                            entry.get::<String>(1)?,
+                            entry.get::<String>(2).unwrap_or_default(),
+                        ))
+                    })
+                    .collect::<LuaResult<_>>()?,
                 _ => {
                     return Err(mlua::Error::runtime(
                         "set_status_hint expects a table or nil",
                     ));
                 }
+            };
+            if let Some(mut store) = lua.app_data_mut::<HintStore>() {
+                store.set(Arc::clone(&p), session, spans);
             }
             publish_hint_snapshot(lua);
             Ok(())
@@ -2253,32 +2311,36 @@ mod tests {
         assert_eq!(span_style(&list_line, 1), STYLE_LIST_MARKER);
     }
 
-    #[test]
-    fn hint_store_set_and_clear() {
+    #[test_case(false, &[] ; "without_session_clears_every_slot")]
+    #[test_case(true, &[None] ; "with_session_clears_only_its_slot")]
+    fn hint_store_empty_spans_clear(with_session: bool, left: &[Option<MakiId>]) {
         let mut store = HintStore::new();
-        store.set(Arc::from("plug"), vec![("a".into(), "b".into())]);
-        assert_eq!(store.snapshot_entries().len(), 1);
+        let session = MakiId::generate();
+        store.set(Arc::from("plug"), None, spans("a"));
+        store.set(Arc::from("plug"), Some(session), spans("b"));
 
-        store.clear_plugin("plug");
-        assert!(store.snapshot_entries().is_empty());
+        store.set(
+            Arc::from("plug"),
+            with_session.then_some(session),
+            Vec::new(),
+        );
+
+        let sessions: Vec<_> = store.snapshot_entries().iter().map(|e| e.session).collect();
+        assert_eq!(sessions, left);
     }
 
     #[test]
     fn hint_store_deterministic_order() {
         let mut store = HintStore::new();
-        store.set(Arc::from("zzz"), vec![("z".into(), "z".into())]);
-        store.set(Arc::from("aaa"), vec![("a".into(), "a".into())]);
+        store.set(Arc::from("zzz"), None, spans("z"));
+        store.set(Arc::from("aaa"), None, spans("a"));
         let entries = store.snapshot_entries();
-        assert_eq!(entries[0].0.as_ref(), "aaa");
-        assert_eq!(entries[1].0.as_ref(), "zzz");
+        assert_eq!(entries[0].plugin.as_ref(), "aaa");
+        assert_eq!(entries[1].plugin.as_ref(), "zzz");
     }
 
-    #[test]
-    fn hint_store_empty_clears() {
-        let mut store = HintStore::new();
-        store.set(Arc::from("plug"), vec![("a".into(), "b".into())]);
-        store.set(Arc::from("plug"), vec![]);
-        assert!(store.snapshot_entries().is_empty());
+    fn spans(text: &str) -> Vec<(String, String)> {
+        vec![(text.into(), String::new())]
     }
 
     const WIN_PLUGIN: &str = "plug";

@@ -8588,3 +8588,175 @@ fn a_ctx_session_pays_for_reach_whoever_could_answer(answerable: bool) {
     };
     assert!(text.text.contains("fs_write"), "got: {}", text.text);
 }
+
+/// One plugin process serves every tab, so each window and hint has to say
+/// which tab it is for. A background agent's window should never pop up on
+/// the tab the user is looking at.
+mod session_owned_ui {
+    use super::*;
+
+    const PLUGIN: &str = "owned_ui";
+    const OPEN_TOOL: &str = "open_owned";
+    const HINT_TOOL: &str = "hint_owned";
+    const COMMAND: &str = "/open_owned";
+    const NO_OPEN_WIN: &str = "open_win never reached the UI";
+    const OPEN_WIN_TIMEOUT: Duration = Duration::from_secs(30);
+    const BAD_SESSION_ERR: &str = "open_win: bad session";
+    const UNKNOWN_HINT_OPT_ERR: &str = "\"sesion\"";
+
+    const SRC: &str = r#"
+    local function open(opts)
+        opts = opts or {}
+        opts.focus = false
+        maki.ui.open_win(maki.ui.buf({ scratch = true }), opts)
+    end
+
+    maki.api.register_tool({
+        name = "open_owned",
+        description = "opens a window",
+        schema = {
+            type = "object",
+            properties = { opts = { type = "object" }, deferred = { type = "boolean" } },
+        },
+        handler = function(input)
+            if input.deferred then
+                maki.async.run(function() open(input.opts) end)
+            else
+                open(input.opts)
+            end
+            return ""
+        end,
+    })
+
+    maki.api.register_tool({
+        name = "hint_owned",
+        description = "sets a hint",
+        schema = { type = "object", properties = { opts = { type = "object" } } },
+        handler = function(input)
+            maki.ui.set_status_hint({ { "hint", "" } }, input.opts)
+            return ""
+        end,
+    })
+
+    maki.api.register_command({
+        name = "/open_owned",
+        description = "opens a window",
+        handler = function() open(nil) end,
+    })
+    "#;
+
+    fn host() -> (Arc<ToolRegistry>, PluginHost) {
+        let reg = fresh_registry();
+        let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+        host.load_source(PLUGIN, SRC).unwrap();
+        (reg, host)
+    }
+
+    fn ctx_in(session: MakiId) -> ToolContext {
+        let mut ctx = maki_agent::tools::test_support::stub_ctx(&AgentMode::Build);
+        ctx.session_id = Some(SessionRef::from_id(session));
+        ctx
+    }
+
+    fn for_session(session: impl ToString) -> Value {
+        json!({ "opts": { "session": session.to_string() } })
+    }
+
+    /// Waits, since a `maki.async.run` window opens after the call returns.
+    fn opened_in(host: &PluginHost) -> Option<MakiId> {
+        let rx = host.ui_action_rx();
+        loop {
+            if let maki_lua::UiAction::OpenWin { session, .. } =
+                rx.recv_timeout(OPEN_WIN_TIMEOUT).expect(NO_OPEN_WIN)
+            {
+                return session;
+            }
+        }
+    }
+
+    fn hint_owners(host: &PluginHost) -> Vec<Option<MakiId>> {
+        host.hint_reader()
+            .load_full()
+            .entries
+            .iter()
+            .map(|e| e.session)
+            .collect()
+    }
+
+    #[test_case::test_case(false ; "handler")]
+    #[test_case::test_case(true ; "async_run_under_handler")]
+    fn window_goes_to_the_calling_session(deferred: bool) {
+        let (reg, host) = host();
+        let caller = MakiId::generate();
+
+        let input = json!({ "deferred": deferred });
+        exec_with_ctx(&reg, OPEN_TOOL, input, &ctx_in(caller)).unwrap();
+
+        assert_eq!(opened_in(&host), Some(caller));
+    }
+
+    #[test]
+    fn explicit_session_wins_over_the_caller() {
+        let (reg, host) = host();
+        let named = MakiId::generate();
+
+        exec_with_ctx(
+            &reg,
+            OPEN_TOOL,
+            for_session(named),
+            &ctx_in(MakiId::generate()),
+        )
+        .unwrap();
+
+        assert_eq!(opened_in(&host), Some(named));
+    }
+
+    /// Nothing ties a command to a session, so the UI puts it on the
+    /// focused tab.
+    #[test]
+    fn window_outside_a_tool_call_has_no_owner() {
+        let (_reg, host) = host();
+
+        host.event_handle()
+            .run_command(Arc::from(PLUGIN), Arc::from(COMMAND), String::new(), 0);
+
+        assert_eq!(opened_in(&host), None);
+    }
+
+    /// A typo here would quietly put the window or hint in the wrong tab.
+    #[test_case::test_case(OPEN_TOOL, for_session("not-a-session"), BAD_SESSION_ERR ; "open_win_bad_session")]
+    #[test_case::test_case(HINT_TOOL, json!({ "opts": { "sesion": "x" } }), UNKNOWN_HINT_OPT_ERR ; "hint_unknown_option")]
+    fn bad_session_options_throw(tool: &str, input: Value, expected: &str) {
+        let (reg, _host) = host();
+
+        let err = exec_with_ctx(&reg, tool, input, &ctx_in(MakiId::generate())).unwrap_err();
+
+        assert!(err.contains(expected), "got: {err}");
+    }
+
+    /// Unlike a window, a hint takes no session from the call. One plugin
+    /// would fill one slot from its tool and another from its keymap
+    /// otherwise, and the tab of that call would show both.
+    #[test]
+    fn hint_without_session_shows_in_every_tab_even_from_a_tool_call() {
+        let (reg, host) = host();
+
+        exec_with_ctx(&reg, HINT_TOOL, json!({}), &ctx_in(MakiId::generate())).unwrap();
+
+        assert_eq!(hint_owners(&host), [None]);
+    }
+
+    #[test]
+    fn ending_a_session_takes_only_its_hints() {
+        let (reg, host) = host();
+        let (ended, kept) = (MakiId::generate(), MakiId::generate());
+        for input in [json!({}), for_session(ended), for_session(kept)] {
+            exec_with_ctx(&reg, HINT_TOOL, input, &ctx_in(MakiId::generate())).unwrap();
+        }
+
+        host.event_handle()
+            .end_sessions_blocking([ended], SessionEndReason::Delete);
+
+        assert_eq!(hint_owners(&host), [None, Some(kept)]);
+    }
+}

@@ -37,7 +37,7 @@ use maki_lua::session_snapshot::{
 use maki_lua::{
     EventHandle, HintReader, InputMode, InputRequest, InputRulesReader, Key, KeymapReader,
     LuaCommandReader, ModelRequest, PackCommand, PackPreparation, PlanRequest, SessionEndReason,
-    SessionRequest, TaskRequest, UiAction, UiAttachment, UiReply,
+    SessionRequest, TaskRequest, UiAction, UiAttachment, UiReply, WinEvent,
 };
 use maki_providers::Timeouts;
 use maki_providers::models_cache::{ModelList, fetch_all_models_cached};
@@ -50,7 +50,7 @@ use maki_storage::sessions::normalize_title;
 use ratatui::backend::Backend;
 use ratatui::layout::Rect;
 use serde_json::json;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::agent::{
     AgentHandles, ModelSlot, ModelSlots,
@@ -1003,13 +1003,19 @@ impl<'t> EventLoop<'t> {
                 let _ = reply_tx.send(code);
             }
             UiAction::OpenWin {
+                session,
                 buf,
                 config,
                 focus,
                 event_tx,
                 cmd_rx,
             } => {
-                let app = self.focused_app();
+                let Some(idx) = self.tab_of(session) else {
+                    debug!(session = ?session, "open_win for a session open in no tab, closed");
+                    let _ = event_tx.try_send(WinEvent::Close);
+                    return;
+                };
+                let app = &mut self.sessions[idx].app;
                 app.float_mgr.open(buf, config, focus, event_tx, cmd_rx);
                 if focus {
                     app.transition_plan(crate::app::mode::PlanTrigger::InteractivePrompt);
@@ -1602,14 +1608,20 @@ impl<'t> EventLoop<'t> {
         self.sessions.iter().position(|rt| rt.id() == id)
     }
 
-    /// No id means the focused session. A plugin holding the id of a tab that
-    /// has since closed gets `session not live` back, so it knows to stop.
+    /// No session means the focused tab. A session that is open in no tab
+    /// has none, and the request should not land on some other tab instead.
+    fn tab_of(&self, session: Option<MakiId>) -> Option<usize> {
+        match session {
+            None => Some(self.focused),
+            Some(id) => self.position(id),
+        }
+    }
+
+    /// A plugin holding the id of a tab that has since closed gets
+    /// `session not live` back, so it knows to stop.
     fn resolve_session_index(&self, id: Option<&str>) -> Result<usize, String> {
-        let Some(id) = id else {
-            return Ok(self.focused);
-        };
-        let parsed = parse_session_id(id)?;
-        self.position(parsed).ok_or_else(|| NOT_LIVE_ERR.into())
+        let session = id.map(parse_session_id).transpose()?;
+        self.tab_of(session).ok_or_else(|| NOT_LIVE_ERR.into())
     }
 
     /// The totals live on the session, so a plugin that reloads mid run keeps

@@ -40,9 +40,9 @@ use maki_lua::test_support::{
     probed_event_handle, set_mode,
 };
 use maki_lua::{
-    BuiltinAction, Dimension, FloatConfig, HintReader, InputRequest, InputRulesReader, InputSubmit,
-    KeybindTicket, KeymapReader, LuaCommandInfo, LuaCommandReader, Missing, PASTE, PackCommand,
-    PackPlan, PackPreparation, PackReport, Permission, PluginHost, PluginPermissions,
+    BuiltinAction, Dimension, FloatConfig, HintEntry, HintReader, InputRequest, InputRulesReader,
+    InputSubmit, KeybindTicket, KeymapReader, LuaCommandInfo, LuaCommandReader, Missing, PASTE,
+    PackCommand, PackPlan, PackPreparation, PackReport, Permission, PluginHost, PluginPermissions,
     SessionEndReason, Split, TextEdit, UiAction, WinCommand, WinEvent,
 };
 use maki_providers::{
@@ -3136,10 +3136,7 @@ fn tick_drains_live_bufs_of_background_chats() {
 #[test]
 fn status_hints_published_by_a_plugin_reach_the_screen() {
     let (mut app, plugin) = app_with_hints();
-    plugin.publish(vec![(
-        Arc::from(HINT_PLUGIN),
-        vec![(HINT_TEXT.into(), HINT_STYLE.into())],
-    )]);
+    plugin.publish(vec![hint_for(None)]);
 
     assert!(
         !rendered(&mut app).contains(HINT_TEXT),
@@ -3151,6 +3148,30 @@ fn status_hints_published_by_a_plugin_reach_the_screen() {
     plugin.publish(vec![]);
     assert_eq!(app.tick(), Dirty::YES, "{OWED}");
     assert!(!rendered(&mut app).contains(HINT_TEXT));
+}
+
+fn hint_for(session: Option<MakiId>) -> HintEntry {
+    HintEntry {
+        plugin: Arc::from(HINT_PLUGIN),
+        session,
+        spans: vec![(HINT_TEXT.into(), HINT_STYLE.into())],
+    }
+}
+
+#[test_case(true ; "own_session")]
+#[test_case(false ; "other_session")]
+fn session_hint_shows_only_in_its_tab(own: bool) {
+    let (mut app, plugin) = app_with_hints();
+    let owner = if own {
+        app.state.session.id
+    } else {
+        MakiId::generate()
+    };
+    plugin.publish(vec![hint_for(Some(owner))]);
+
+    let _ = app.tick();
+
+    assert_eq!(rendered(&mut app).contains(HINT_TEXT), own);
 }
 
 const RENDERED_WIDTH: u16 = 80;
@@ -6510,6 +6531,21 @@ fn open_window(
         .open(Arc::clone(buf), config, focus, event_tx, cmd_rx);
     let _ = draw_to_buffer(app);
     (event_rx, cmd_tx)
+}
+
+/// Plugins like todo_write forget a session's window when the session ends
+/// and trust us to close it. One left open after `/new` would sit on top of
+/// the new chat with nobody to update or close it.
+#[test]
+fn windows_close_when_their_session_leaves_the_tab() {
+    let mut app = test_app();
+    let buf = Arc::new(SharedBuf::new());
+    let (events, _cmd_tx) = open_window(&mut app, &buf, false, WINDOW_Z);
+
+    app.reset_session();
+
+    assert!(!app.float_mgr.is_open());
+    assert!(events.try_iter().any(|ev| matches!(ev, WinEvent::Close)));
 }
 
 fn owner(probe: &RequestProbe) -> Option<String> {

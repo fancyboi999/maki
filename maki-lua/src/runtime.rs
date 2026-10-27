@@ -57,7 +57,7 @@ use crate::api::tool::{
 };
 use crate::api::ui::buf::{BufHandle, BufferStore};
 use crate::api::ui::marks::{InputRuleStore, InputRulesReader};
-use crate::api::ui::{HintStore, WinStore};
+use crate::api::ui::{HintStore, WinStore, clear_session_hints};
 use crate::api::util::command::{CommandHandlerMap, HintWriter, publish_command_snapshot};
 use crate::api::util::command::{
     LuaCommandReader, LuaCommandWriter, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction,
@@ -496,8 +496,8 @@ pub enum Request {
         plugin: Arc<str>,
         command: Arc<str>,
         args: String,
-        /// How many `maki.api.run_command` hops led here; seeds the handler's
-        /// [`TaskCell::command_depth`] so an alias cycle terminates.
+        /// How many `maki.api.run_command` hops led here. It seeds the
+        /// handler's [`Lineage::command_depth`], so an alias cycle runs out.
         depth: u8,
     },
     CollectPromptSlots {
@@ -747,10 +747,7 @@ pub(crate) struct TaskCell {
     /// Set by [`TaskScope::new`]; `enqueue_async_task` upgrades it so queued
     /// tasks share ownership of `bufs`. See [`BufsClaim`].
     bufs_claim: Weak<BufsClaim>,
-    /// Slash-command hops that led to this task, so `maki.api.run_command`
-    /// can refuse to extend a chain that never ends. Inherited by
-    /// `maki.async.run` tasks, or a cycle could hop through one and reset it.
-    pub(crate) command_depth: u8,
+    pub(crate) lineage: Lineage,
     /// True while running a command the user typed or a key they pressed, so
     /// `maki.task.stop` knows a person asked for it. `maki.async` tasks start
     /// without it, since they can run long after the keypress. So do commands
@@ -759,6 +756,27 @@ pub(crate) struct TaskCell {
     /// Set under a `maki.async.spawn` task and passed down to the runs it
     /// queues. [`TaskLifetime::Detached`] says why.
     detached: bool,
+}
+
+/// What a task passes down to the `maki.async.run` tasks it queues. It travels
+/// as one value, so a new field here reaches every queued task without
+/// touching each path that queues one.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Lineage {
+    /// Slash-command hops that led to this task, so `maki.api.run_command`
+    /// can refuse a chain that never ends. A keybind or tool starts at 0.
+    pub(crate) command_depth: u8,
+    /// The session whose tool call this task serves. Its windows go to that
+    /// session's tab, which is not always the one on screen.
+    pub(crate) session: Option<MakiId>,
+}
+
+impl Lineage {
+    pub(crate) fn current(lua: &Lua) -> Self {
+        lua.app_data_ref::<TaskHandle>()
+            .map(|handle| lock_cell(&handle).lineage.clone())
+            .unwrap_or_default()
+    }
 }
 
 impl TaskCell {
@@ -784,7 +802,7 @@ impl TaskCell {
             cancel_hooks: Vec::new(),
             bufs_claim: Weak::new(),
             owns_jobs: true,
-            command_depth: 0,
+            lineage: Lineage::default(),
             user_action: false,
             detached: false,
         }
@@ -1724,7 +1742,7 @@ pub(crate) async fn run_command_scoped<F: Future>(lua: &Lua, depth: u8, fut: F) 
     let scope = TaskScope::detached(lua);
     {
         let mut cell = lock_cell(scope.handle());
-        cell.command_depth = depth;
+        cell.lineage.command_depth = depth;
         cell.user_action = depth == 0;
     }
     run_scoped(lua, scope, fut).await
@@ -1788,6 +1806,7 @@ async fn run_host_hook(lua: &Lua, hook: HostHook) {
             BackgroundSessions::of(lua).end_session(end.session);
             // Nothing can pick from this session's plan form again.
             clear_session_rows(lua, &end.session.to_string());
+            clear_session_hints(lua, end.session);
             if let Some((_, reply)) = end.wait {
                 let _ = reply.send(());
             }
@@ -1923,13 +1942,6 @@ pub(crate) fn active_task_cancel(lua: &Lua) -> Option<(u64, CancelToken)> {
     Some((cell.id, cell.cancel.clone()))
 }
 
-/// Slash-command hops that led to the running task; 0 outside a command
-/// handler, so a keybind or tool calling `maki.api.run_command` starts fresh.
-pub(crate) fn command_depth(lua: &Lua) -> u8 {
-    lua.app_data_ref::<TaskHandle>()
-        .map_or(0, |handle| lock_cell(&handle).command_depth)
-}
-
 pub(crate) fn is_user_action(lua: &Lua) -> bool {
     lua.app_data_ref::<TaskHandle>()
         .is_some_and(|handle| lock_cell(&handle).user_action)
@@ -1977,17 +1989,17 @@ pub(crate) fn enqueue_async_task(
     work_fn: RegistryKey,
 ) -> Result<(), mlua::Error> {
     let handle = lua.app_data_ref::<TaskHandle>();
-    let (cancel, live_ctx, command_depth, detached) = match &handle {
+    let (cancel, live_ctx, lineage, detached) = match &handle {
         Some(h) => {
             let cell = lock_cell(h);
             (
                 cell.cancel.clone(),
                 cell.live.clone(),
-                cell.command_depth,
+                cell.lineage.clone(),
                 cell.detached,
             )
         }
-        None => (CancelToken::none(), None, 0, false),
+        None => (CancelToken::none(), None, Lineage::default(), false),
     };
 
     let mut task = PendingAsyncTask {
@@ -1996,7 +2008,7 @@ pub(crate) fn enqueue_async_task(
         deadline: Some(Instant::now() + ASYNC_RUN_DEFAULT_DEADLINE),
         live_ctx,
         owner: None,
-        command_depth,
+        lineage,
         ceiling: Ceiling::current_for(lua, plugin),
         lifetime: match detached {
             true => TaskLifetime::Detached,
@@ -2024,7 +2036,10 @@ pub(crate) fn enqueue_async_task(
 
 /// A spawn belongs to {plugin}, not to its caller, so it takes nothing of
 /// the caller's lifetime. Only the command depth carries over, or a command
-/// cycle could hop through a spawn and start counting from zero again.
+/// cycle could hop through a spawn and start counting from zero again. The
+/// session stays behind. A loop started from one tool call would open every
+/// later window in that call's tab otherwise, and lose them all when the
+/// session leaves.
 ///
 /// It never goes to `inline_spawn`. A restore runs those tasks to the end
 /// before it snapshots, and a spawned loop has no end.
@@ -2054,7 +2069,10 @@ pub(crate) fn enqueue_spawned_task(
             deadline: None,
             live_ctx: None,
             owner: None,
-            command_depth: command_depth(lua),
+            lineage: Lineage {
+                session: None,
+                ..Lineage::current(lua)
+            },
             ceiling,
             lifetime: TaskLifetime::Spawned(handle.clone()),
         })
@@ -2359,7 +2377,7 @@ pub(crate) struct PendingAsyncTask {
     pub deadline: Option<Instant>,
     pub live_ctx: Option<LiveCtx>,
     pub owner: Option<Arc<BufsClaim>>,
-    pub command_depth: u8,
+    pub lineage: Lineage,
     /// The [`Ceiling`] up where the task was queued, which it runs under.
     pub ceiling: Option<Ceiling>,
     pub lifetime: TaskLifetime,
@@ -2760,7 +2778,7 @@ fn spawn_async_task(
         let slot = Some(g.admit((!detached).then(|| DrainHold::new(&g))).await);
 
         let mut cell = TaskCell::new(task.cancel.clone(), task.deadline, task.live_ctx.clone());
-        cell.command_depth = task.command_depth;
+        cell.lineage = task.lineage.clone();
         cell.detached = detached;
         let scope = TaskScope::new(&lua, cell);
         let handle = Arc::clone(scope.handle());
@@ -2818,7 +2836,7 @@ fn spawn_plugin_task(
     let lua = lua.clone();
     ex.spawn(async move {
         let mut cell = TaskCell::new(task.cancel.clone(), None, None);
-        cell.command_depth = task.command_depth;
+        cell.lineage = task.lineage.clone();
         cell.detached = true;
         let scope = TaskScope::new(&lua, cell);
         // On cancel, `call_async` drops the Rust future the task is parked in
@@ -3830,12 +3848,13 @@ async fn run_inline_tasks(lua: &Lua, scope: &TaskScope) {
             if !task.cancel.is_cancelled() {
                 // Its own cell: the window is per task, not the restore
                 // scope's, and only `until_abandoned` reads it.
-                let handle = TaskCell::new(
+                let mut cell = TaskCell::new(
                     task.cancel.clone(),
                     Some(Instant::now() + RESTORE_ASYNC_DEADLINE),
                     None,
-                )
-                .into_handle();
+                );
+                cell.lineage = task.lineage.clone();
+                let handle = cell.into_handle();
                 let run = run_work_fn(lua, &task.work_fn, &handle);
                 if let Err(e) = scope
                     .scope_future(Narrowed::under(lua, task.ceiling.clone(), run))
@@ -4542,7 +4561,9 @@ async fn run_tool_start(
     live: LiveCtx,
     ctx: Box<LuaCtx>,
 ) {
-    let scope = TaskScope::new(lua, TaskCell::new(ctx.cancel.clone(), None, Some(live)));
+    let mut cell = TaskCell::new(ctx.cancel.clone(), None, Some(live));
+    cell.lineage.session = ctx.session();
+    let scope = TaskScope::new(lua, cell);
     let run = async {
         let input_lua = json_to_lua(lua, &input)?;
         let ctx_ud = lua.create_userdata(*ctx)?;
@@ -4596,6 +4617,7 @@ async fn run_tool_call(
         Err(e) => return ToolCallReply::err(strip_traceback(&e)),
     };
     let live_sink = ctx.agent().and_then(|a| a.live_sink.clone());
+    let session = ctx.session();
     let ctx_ud = match lua.create_userdata(*ctx) {
         Ok(u) => u,
         Err(e) => return ToolCallReply::err(strip_traceback(&e)),
@@ -4604,6 +4626,7 @@ async fn run_tool_call(
     let live_id = live.as_ref().map(|l| l.tool_use_id.clone());
     let mut cell = TaskCell::new(cancel.clone(), deadline, live);
     cell.live_sink = live_sink;
+    cell.lineage.session = session;
     let scope = TaskScope::new(&lua, cell);
     let handle = Arc::clone(scope.handle());
 
@@ -5898,18 +5921,23 @@ mod tests {
     }
 
     /// Without this a `run_command` cycle could hop through `maki.async.run`
-    /// and start over at depth 0, so the cap would never trip.
+    /// and start over at depth 0, and a window opened from it would land in
+    /// the wrong tab.
     #[test]
-    fn enqueue_async_task_inherits_command_depth() {
+    fn enqueue_async_task_inherits_lineage() {
         let lua = enqueue_test_lua();
+        let lineage = Lineage {
+            command_depth: 3,
+            session: Some(MakiId::generate()),
+        };
         let mut cell = TaskCell::new(CancelToken::none(), None, None);
-        cell.command_depth = 3;
+        cell.lineage = lineage.clone();
         let scope = TaskScope::new(&lua, cell);
         let _active = scope.enter();
         enqueue_async_task(&lua, SPAWN_PLUGIN, enqueue_dummy(&lua)).unwrap();
 
         let queue = lua.app_data_ref::<SpawnQueue>().unwrap();
-        assert_eq!(queue.rx.try_recv().unwrap().command_depth, 3);
+        assert_eq!(queue.rx.try_recv().unwrap().lineage, lineage);
     }
 
     /// A task the owner queues while its action holds only the price runs
@@ -6023,7 +6051,7 @@ mod tests {
             deadline,
             live_ctx: None,
             owner: None,
-            command_depth: 0,
+            lineage: Lineage::default(),
             ceiling: None,
             lifetime: TaskLifetime::Held,
         }
@@ -6101,7 +6129,10 @@ mod tests {
         let lua = spawn_test_lua();
         let (trigger, token) = CancelToken::new();
         let mut cell = TaskCell::new(token, Some(Instant::now()), None);
-        cell.command_depth = SPAWN_COMMAND_DEPTH;
+        cell.lineage = Lineage {
+            command_depth: SPAWN_COMMAND_DEPTH,
+            session: Some(MakiId::generate()),
+        };
         cell.inline_spawn = Some(Vec::new());
         let scope = TaskScope::new(&lua, cell);
         let _active = scope.enter();
@@ -6115,7 +6146,13 @@ mod tests {
         );
         assert_eq!(task.deadline, None);
         assert!(task.owner.is_none(), "it must not pin the caller's bufs");
-        assert_eq!(task.command_depth, SPAWN_COMMAND_DEPTH);
+        assert_eq!(
+            task.lineage,
+            Lineage {
+                command_depth: SPAWN_COMMAND_DEPTH,
+                session: None,
+            }
+        );
         assert!(matches!(&task.lifetime, TaskLifetime::Spawned(s) if &*s.plugin == SPAWN_PLUGIN));
     }
 
@@ -6214,7 +6251,7 @@ mod tests {
         lua.globals().set("queue_run", queue_run).unwrap();
         let (_, task) = {
             let mut cell = TaskCell::new(CancelToken::none(), None, None);
-            cell.command_depth = SPAWN_COMMAND_DEPTH;
+            cell.lineage.command_depth = SPAWN_COMMAND_DEPTH;
             let scope = TaskScope::new(&lua, cell);
             let _active = scope.enter();
             spawn_src(&lua, SPAWN_PLUGIN, QUEUE_RUN_AND_PARK_SRC)
@@ -6228,7 +6265,7 @@ mod tests {
         }));
 
         assert!(matches!(run.lifetime, TaskLifetime::Detached));
-        assert_eq!(run.command_depth, SPAWN_COMMAND_DEPTH);
+        assert_eq!(run.lineage.command_depth, SPAWN_COMMAND_DEPTH);
         assert!(!run.cancel.is_cancelled());
         lua.app_data_ref::<SpawnedTasks>()
             .unwrap()
@@ -6863,7 +6900,7 @@ mod tests {
             deadline: None,
             live_ctx: None,
             owner: None,
-            command_depth: 0,
+            lineage: Lineage::default(),
             ceiling: None,
             lifetime: TaskLifetime::Held,
         };

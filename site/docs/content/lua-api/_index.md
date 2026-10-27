@@ -7433,6 +7433,10 @@ Opens a floating or split window that displays the contents of {buf}.
 Returns a Win handle you can use to receive events, update layout,
 and close the window when you are done.
 
+A window belongs to one session and shows only while that session's tab is
+focused. It closes when the session leaves its tab (`/new`, loading another
+session, closing the tab), or right away if the session is not in any tab.
+
 **Parameters:**
 
 - `{buf}` ([`Buf`](#maki-ui-Buf)) Buffer to display.
@@ -7457,6 +7461,7 @@ and close the window when you are done.
   - `visible` (`boolean`) whether the window is initially visible. Default true. See `win:hide()` for what hiding does.
   - `needs_input` (`boolean`) whether the window means the session needs user input. Default false.
   - `stack` (`boolean`) offset the window past the other stacked windows sharing its anchor, in open order, with a one row gap. Closing one moves the rest up. Floating windows only. Default false.
+  - `session` (`string`) id of the session that owns the window, e.g. `ev.data.session_id` or `ctx:session_id()`. Default: the session of the running tool call, else the focused tab's. A `maki.async.run` task keeps the tool call's session, a `maki.async.spawn` task does not.
 
 **Returns:** ([`Win`](#maki-ui-Win)) Window handle.
 
@@ -7479,14 +7484,15 @@ local win = maki.ui.open_win(buf, {
 ### `maki.ui.set_status_hint()` {#maki-ui-set_status_hint}
 
 ```lua
-maki.ui.set_status_hint({spans})
+maki.ui.set_status_hint({spans}, {opts?})
 ```
 
-Shows key hints in the status bar for your plugin. Each hint is a {key, label} pair. Pass nil to clear your plugin's hints. Only your own hints are affected, other plugins keep theirs.
+Shows your plugin's key hints in the status bar. Other plugins' hints are not affected. By default the hints show in every tab, even when set from a tool call. With `opts.session` they show only in that session's tab, replacing your every-tab hints there, and are cleared when the session leaves the tab.
 
 **Parameters:**
 
-- `{spans}` (`table|nil`) Sequence of {key, label} pairs, e.g. `{{"q", "quit"}, {"j", "down"}}`. Pass nil to remove the plugin's hints.
+- `{spans}` (`table|nil`) Sequence of {key, label} pairs, e.g. `{{"q", "quit"}, {"j", "down"}}`. nil clears your hints for `opts.session`, or all your hints if `opts.session` is not set.
+- `{opts}` (`table?`) `session` (string): id of the session whose tab shows the hints, e.g. `ev.data.session_id` or `ctx:session_id()`. Default: every tab.
 
 **Example:**
 
@@ -7494,6 +7500,18 @@ Shows key hints in the status bar for your plugin. Each hint is a {key, label} p
 maki.ui.set_status_hint({ {"q", "quit"}, {"j", "down"} })
 -- later, clear them:
 maki.ui.set_status_hint(nil)
+
+-- Only in the tab of the session that is running a turn:
+maki.api.create_autocmd("TurnStart", {
+  callback = function(ev)
+    maki.ui.set_status_hint({ {"Esc", "cancel"} }, { session = ev.data.session_id })
+  end,
+})
+maki.api.create_autocmd("TurnEnd", {
+  callback = function(ev)
+    maki.ui.set_status_hint(nil, { session = ev.data.session_id })
+  end,
+})
 ```
 
 ---

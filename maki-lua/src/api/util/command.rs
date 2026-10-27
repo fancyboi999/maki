@@ -100,12 +100,37 @@ impl LuaCommandWriter {
     }
 }
 
-pub type HintEntries = Vec<(Arc<str>, Vec<(String, String)>)>;
+#[derive(Clone, Debug, PartialEq)]
+pub struct HintEntry {
+    pub plugin: Arc<str>,
+    /// `None` shows in every tab.
+    pub session: Option<MakiId>,
+    pub spans: Vec<(String, String)>,
+}
+
+pub type HintEntries = Vec<HintEntry>;
 
 #[derive(Clone, Default)]
 pub struct HintSnapshot {
     pub entries: HintEntries,
     pub generation: u64,
+}
+
+impl HintSnapshot {
+    /// A plugin's hint for this session takes the place of its every-tab
+    /// hint here. A plugin often sets both, one from a keymap and one from a
+    /// tool call, and the tab would show it twice otherwise.
+    pub fn visible_in(&self, session: MakiId) -> impl Iterator<Item = &HintEntry> {
+        self.entries
+            .iter()
+            .filter(move |entry| match entry.session {
+                Some(owner) => owner == session,
+                None => !self
+                    .entries
+                    .iter()
+                    .any(|other| other.plugin == entry.plugin && other.session == Some(session)),
+            })
+    }
 }
 
 #[derive(Clone)]
@@ -744,6 +769,8 @@ impl BuiltinAction {
 
 pub enum UiAction {
     OpenWin {
+        /// `None` opens it in the focused tab.
+        session: Option<MakiId>,
         buf: Arc<SharedBuf>,
         config: FloatConfig,
         focus: bool,
@@ -1213,13 +1240,45 @@ mod tests {
         let (writer, reader) = HintWriter::new();
         assert!(reader.load_full().entries.is_empty());
 
-        writer.publish(vec![(
-            Arc::from("plugA"),
-            vec![(" 2/4 ".into(), "fg".into())],
-        )]);
+        writer.publish(vec![hint(OTHER_PLUGIN, None, EVERY_TAB_HINT)]);
 
         let snap = reader.load_full();
         assert_eq!(snap.entries.len(), 1);
         assert_eq!(snap.generation, 1);
+    }
+
+    const SHADOWED_PLUGIN: &str = "shadowed";
+    const OTHER_PLUGIN: &str = "other";
+    const EVERY_TAB_HINT: &str = "every tab";
+    const SESSION_HINT: &str = "session";
+
+    fn hint(plugin: &str, session: Option<MakiId>, text: &str) -> HintEntry {
+        HintEntry {
+            plugin: Arc::from(plugin),
+            session,
+            spans: vec![(text.into(), String::new())],
+        }
+    }
+
+    #[test_case(true, &[EVERY_TAB_HINT, SESSION_HINT] ; "own_tab_swaps_in_the_session_hint")]
+    #[test_case(false, &[EVERY_TAB_HINT, EVERY_TAB_HINT] ; "other_tab_keeps_the_every_tab_hint")]
+    fn session_hint_shadows_the_plugins_every_tab_hint(own_tab: bool, expected: &[&str]) {
+        let owner = MakiId::generate();
+        let snap = HintSnapshot {
+            entries: vec![
+                hint(OTHER_PLUGIN, None, EVERY_TAB_HINT),
+                hint(SHADOWED_PLUGIN, None, EVERY_TAB_HINT),
+                hint(SHADOWED_PLUGIN, Some(owner), SESSION_HINT),
+            ],
+            generation: 0,
+        };
+        let tab = if own_tab { owner } else { MakiId::generate() };
+
+        let shown: Vec<_> = snap
+            .visible_in(tab)
+            .map(|entry| entry.spans[0].0.as_str())
+            .collect();
+
+        assert_eq!(shown, expected);
     }
 }

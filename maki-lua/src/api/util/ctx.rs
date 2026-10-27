@@ -9,7 +9,7 @@ use maki_agent::tools::{
     Deadline, FileKey, MAIN_TASK_ID, ToolAudience, ToolContext, ToolLive, ToolOutputMode,
 };
 use maki_config::{AgentConfig, ToolOutputLines};
-use maki_storage::id::SessionRef;
+use maki_storage::id::{MakiId, SessionRef};
 use mlua::{LuaSerdeExt, MultiValue, UserData, UserDataMethods, Value as LuaValue};
 
 use crate::api::tool::ToolCallReply;
@@ -170,6 +170,10 @@ impl LuaCtx {
             task_id: ctx.task_id,
             finish_tx: None,
         }
+    }
+
+    pub(crate) fn session(&self) -> Option<MakiId> {
+        self.session_id.as_ref().map(SessionRef::id)
     }
 
     /// Dispatch capability: only handler ctxs can call `maki.agent.*`.

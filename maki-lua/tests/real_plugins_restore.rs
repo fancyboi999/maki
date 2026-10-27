@@ -8,7 +8,7 @@ use maki_agent::AgentEvent;
 use maki_agent::tools::ToolRegistry;
 use maki_config::ToolOutputLines;
 use maki_lua::{PluginHost, RestoreReason, Split, UiAction};
-use maki_storage::id::SessionRef;
+use maki_storage::id::{MakiId, SessionRef};
 use serde_json::{Value, json};
 
 const BASH_SRC: &str = include_str!("../../plugins/bash/init.lua");
@@ -443,6 +443,37 @@ fn todo_load_restore_leaves_the_panel_closed() {
         |action| matches!(action, UiAction::OpenWin { config, .. } if config.split == Split::Panel),
     );
     assert!(!opened, "a load restore must not refill the panel");
+}
+
+/// Each tab gets a panel of its own. The plugin used to share one window, and
+/// it stayed in the tab it first opened in, so every other tab's list was
+/// drawn there, out of sight.
+#[test]
+fn todo_panel_opens_in_the_tab_of_each_writing_session() {
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(TODO_TOOL, TODO_SRC).unwrap();
+    let sessions = [MakiId::generate(), MakiId::generate()];
+    let input = json!({ "todos": [{ "content": TODO_ITEM, "status": "in_progress" }] });
+    let tool = &reg.get(TODO_TOOL).unwrap().tool;
+
+    for session in sessions {
+        let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+        ctx.session_id = Some(SessionRef::from_id(session));
+        smol::block_on(tool.parse(&input).unwrap().execute(&ctx));
+    }
+
+    let owners: Vec<_> = host
+        .ui_action_rx()
+        .drain()
+        .filter_map(|action| match action {
+            UiAction::OpenWin {
+                session, config, ..
+            } if config.split == Split::Panel => Some(session),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(owners, sessions.map(Some));
 }
 
 const WHICH_TASK_SRC: &str = r#"
