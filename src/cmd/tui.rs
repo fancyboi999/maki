@@ -366,7 +366,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         None => startup_warnings.extend(trust.state.restricted_warning()),
     }
 
-    setup::init_logging(&stack.config.storage);
+    setup::init_logging(&stack.config.storage, trust.project_config.config_root());
     setup::init_telemetry(&stack.config.telemetry);
     setup::install_panic_log_hook();
     setup::warn_ignored_provider_fields();
