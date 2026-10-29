@@ -29,7 +29,8 @@ use maki_providers::model::ModelTier;
 use maki_providers::model_registry;
 use maki_providers::provider;
 use maki_providers::{
-    ContentBlock, ContextGauge, Message, Model, RequestOptions, Role, ThinkingConfig, add_cost,
+    AgentError, ContentBlock, ContextGauge, Message, Model, RequestOptions, Role, ThinkingConfig,
+    add_cost,
 };
 use maki_storage::id::MakiId;
 use maki_storage::now_epoch;
@@ -81,14 +82,51 @@ fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Mode
         return Ok(Model::clone(&ctx.model));
     }
     let slug = &ctx.model.provider;
-    model_registry::resolve_tier(Some(slug), effective)
+    if let Some(spec) = model_registry::resolve_tier(Some(slug), effective)
         .filter(|spec| ctx.model_policy.allows(spec))
-        .and_then(|s| Model::from_spec(&s).ok())
-        .map(Ok)
-        .unwrap_or_else(|| {
-            Model::from_tier_with_policy(slug, effective, &ctx.model_policy)
-                .map_err(|e| e.to_string())
-        })
+    {
+        match Model::from_spec(&spec) {
+            Ok(model) => return Ok(model),
+            Err(error) if model_registry::override_tiers(&spec).contains(&effective) => {
+                return Err(tier_failure(&spec, error.to_string()));
+            }
+            Err(_) => {}
+        }
+    }
+    Model::from_tier_with_policy(slug, effective, &ctx.model_policy).map_err(|e| e.to_string())
+}
+
+fn tier_failure(spec: &str, message: String) -> String {
+    let tiers = model_registry::override_tiers(spec);
+    if tiers.is_empty() {
+        return message;
+    }
+    let names = tiers
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let assignment = if tiers.len() == 1 {
+        format!("{names} tier is pinned")
+    } else {
+        format!("{names} tiers are pinned")
+    };
+    let provider = spec
+        .split_once('/')
+        .map(|(slug, _)| format!(" (provider `{slug}`)"))
+        .unwrap_or_default();
+    format!("{assignment} to `{spec}`{provider}. Reassign in `/model`.\n{message}")
+}
+
+/// Let the provider decide what credentials it needs: OAuth and anonymous
+/// endpoints cannot be judged by the presence of an API key.
+fn provider_failure(model: &Model, error: &AgentError) -> String {
+    let message = error.to_string();
+    if matches!(error, AgentError::Config { .. }) || error.is_auth_error() {
+        tier_failure(&model.spec(), message)
+    } else {
+        message
+    }
 }
 
 fn model_to_lua_table(lua: &Lua, model: &Model) -> LuaResult<Table> {
@@ -362,7 +400,10 @@ async fn resolve_model(
         .and_then(|t| t.opt::<String>("spec").ok().flatten());
 
     let model = match spec_str {
-        Some(ref spec) => try_pair!(Model::from_spec_with_policy(spec, &agent.model_policy)),
+        Some(ref spec) => try_pair!(
+            Model::from_spec_with_policy(spec, &agent.model_policy)
+                .map_err(|error| tier_failure(spec, error.to_string()))
+        ),
         None => try_pair!(resolve_model_from_ctx(agent, tier_str.as_deref())),
     };
     Ok((Some(model_to_lua_table(&lua, &model)?), None))
@@ -797,8 +838,15 @@ async fn session(
 
     let (model, provider): (Model, Arc<dyn provider::Provider>) = if let Some(ref spec) = model_spec
     {
-        let mut m = try_pair!(Model::from_spec_with_policy(spec, &agent_ctx.model_policy));
-        let p = try_pair!(provider::from_model_async(&mut m, agent_ctx.timeouts).await);
+        let mut m = try_pair!(
+            Model::from_spec_with_policy(spec, &agent_ctx.model_policy)
+                .map_err(|error| tier_failure(spec, error.to_string()))
+        );
+        let p = try_pair!(
+            provider::from_model_async(&mut m, agent_ctx.timeouts)
+                .await
+                .map_err(|error| provider_failure(&m, &error))
+        );
         (m, Arc::from(p))
     } else {
         (
@@ -1617,7 +1665,7 @@ async fn prompt(
     // reads like an error here even though the run ended normally. A dropped
     // prompt never reached the model, so an empty answer would be a lie.
     let cut_short = match &result {
-        Err(e) => Some(e.to_string()),
+        Err(error) => Some(provider_failure(&s.params.model, error)),
         Ok(DoneReason::Cancelled) if s.stopped_by_user() => Some(STOPPED_BY_USER_ERR.to_owned()),
         Ok(DoneReason::Cancelled) => Some(CANCELLED_MSG.to_owned()),
         Ok(DoneReason::Dropped) => Some(PROMPT_DROPPED_ERR.to_owned()),
@@ -1953,6 +2001,39 @@ mod tests {
     const CHILD_SYSTEM: &str = "You analyse evidence.\n{{instructions}}";
     const CHILD_INSTRUCTIONS: &str = "Keep {{identity}} literal.";
     const CHILD_RESPONSE: &str = "Analysis complete.";
+    const PINNED_SPEC: &str = "zai/glm-5";
+    const PROVIDER_FAILURE: &str = "provider credentials unavailable";
+    const UNAUTHORIZED: u16 = 401;
+    const FORBIDDEN: u16 = 403;
+    const REMOVED_PROVIDER_SPEC: &str = "removed-tier-provider/probe";
+
+    struct RejectingProvider(Option<u16>);
+
+    impl Provider for RejectingProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a JsonValue,
+            _: &'a Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                Err(self.0.map_or_else(
+                    || AgentError::Config {
+                        message: PROVIDER_FAILURE.into(),
+                    },
+                    |status| AgentError::api(status, PROVIDER_FAILURE),
+                ))
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
 
     struct PromptRecorder(Sender<String>);
 
@@ -2373,13 +2454,67 @@ mod tests {
 
         let dir = tempfile::TempDir::new().unwrap();
         maki_providers::model_registry::set_and_persist(
-            "zai/glm-5".into(),
+            PINNED_SPEC.into(),
             ModelTier::Weak,
             &maki_storage::StateDir::from_path(dir.path().to_path_buf()),
         );
 
         let model = resolve_model_from_ctx(&ctx, Some("weak")).unwrap();
-        assert_eq!(model.spec(), "zai/glm-5");
+        assert_eq!(model.spec(), PINNED_SPEC);
         assert_ne!(model.spec(), same_provider_weak);
+
+        for status in [None, Some(UNAUTHORIZED), Some(FORBIDDEN)] {
+            let lua = Lua::new();
+            let mut child = stub_ctx_with(&AgentMode::Build, None, Some(PARENT_ID));
+            child.model = Arc::new(model.clone());
+            child.provider = Arc::new(RejectingProvider(status));
+            smol::block_on(async {
+                let sess = native_session(&lua, &child).await;
+                let (_, error) = prompt(lua.clone(), sess.borrow().unwrap(), CHILD_REQUEST.into())
+                    .await
+                    .unwrap();
+                close(lua.clone(), sess.borrow().unwrap()).await.unwrap();
+                let error = error.unwrap();
+                assert!(error.contains(PROVIDER_FAILURE), "{error}");
+                if status == Some(FORBIDDEN) {
+                    assert_eq!(
+                        error,
+                        AgentError::api(FORBIDDEN, PROVIDER_FAILURE).to_string()
+                    );
+                } else {
+                    assert!(error.contains(PINNED_SPEC), "{error}");
+                    assert!(error.contains("weak tier is pinned"), "{error}");
+                    assert!(error.contains("provider `zai`"), "{error}");
+                    assert!(error.contains("/model"), "{error}");
+                }
+            });
+        }
+
+        let storage = maki_storage::StateDir::from_path(dir.path().to_path_buf());
+        model_registry::set_and_persist(REMOVED_PROVIDER_SPEC.into(), ModelTier::Weak, &storage);
+        let failed = resolve_model_from_ctx(&ctx, Some("weak"));
+        let lua = Lua::new();
+        lua.set_app_data(Arc::clone(ToolRegistry::global_arc()));
+        let parent = lua
+            .create_userdata(LuaCtx::handler(&ctx.to_tool_context()))
+            .unwrap();
+        let options = lua.create_table().unwrap();
+        options.set("model_spec", REMOVED_PROVIDER_SPEC).unwrap();
+        let failed_open = smol::block_on(session(
+            lua.clone(),
+            Arc::from(PLUGIN),
+            PluginPermissions::trusted(),
+            LuaEither::Left(parent.borrow().unwrap()),
+            Some(options),
+        ));
+        model_registry::set_and_persist(PINNED_SPEC.into(), ModelTier::Weak, &storage);
+        let error = failed.unwrap_err();
+        assert!(error.contains(REMOVED_PROVIDER_SPEC), "{error}");
+        assert!(error.contains("/model"), "{error}");
+        let (opened, error) = failed_open.unwrap();
+        assert!(opened.is_none());
+        let error = error.unwrap();
+        assert!(error.contains(REMOVED_PROVIDER_SPEC), "{error}");
+        assert!(error.contains("/model"), "{error}");
     }
 }
