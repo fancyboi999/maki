@@ -3245,7 +3245,7 @@ Requires the `fs_write` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{path}` (`string`) Destination file path. `~/` is expanded.
-- `{content}` (`string`) Text to write.
+- `{content}` (`string|buffer`) Bytes to write.
 
 **Returns:** (`true?`, `string?`) `true` on success, or nil plus an error message.
 
@@ -3272,7 +3272,7 @@ Requires the `fs_write` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{path}` (`string`) Destination file path. `~/` is expanded.
-- `{content}` (`string`) Text to append.
+- `{content}` (`string|buffer`) Bytes to append.
 
 **Returns:** (`true?`, `string?`) `true` on success, or nil plus an error message.
 
@@ -3300,7 +3300,7 @@ Requires the `fs_write` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{path}` (`string`) Destination file path. `~/` is expanded.
-- `{content}` (`string`) Text to write.
+- `{content}` (`string|buffer`) Bytes to write.
 
 **Returns:** (`true?`, `string?`) `true` on success, or nil plus an error message.
 
@@ -4499,7 +4499,7 @@ one. This holds only for an origin the user set (`<SLUG>_BASE_URL`,
 {opts} fields:
 - `method` (`string`) HTTP verb (default `"GET"`).
 - `headers` (`table`) Header name/value pairs.
-- `body` (`string`) Request body.
+- `body` (`string|buffer`) Raw request bytes.
 - `timeout` (`integer`) Total timeout in seconds, max 120 (default 30,
   none on a provider's origin).
 - `max_bytes` (`integer`) Max response size in bytes (default 5 MB).
@@ -4514,6 +4514,8 @@ response's headers under lowercase names, as in
 `res.headers["retry-after"]`. Repeated headers are joined with `, `,
 which breaks `set-cookie`. A failed response can go straight to
 `maki.provider.http_error`.
+`body` is a byte string, including NUL and non-UTF-8 bytes. Text
+consumers can decode it, and files can be saved with `maki.fs.write`.
 
 Requires the `net` [plugin permission](#plugin-permissions).
 
