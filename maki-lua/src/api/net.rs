@@ -439,8 +439,9 @@ fn collect_headers(headers: &HeaderMap) -> Vec<(String, String)> {
 /// `res.headers["retry-after"]`. Repeated headers are joined with `, `,
 /// which breaks `set-cookie`. A failed response can go straight to
 /// `maki.provider.http_error`.
-/// `body` is a byte string, including NUL and non-UTF-8 bytes. Text
-/// consumers can decode it, and files can be saved with `maki.fs.write`.
+/// `body` is a byte string, including NUL and non-UTF-8 bytes. Save it
+/// with `maki.fs.write`. Tool results and `maki.text.html_to_markdown`
+/// replace invalid UTF-8 when turning bytes into text.
 ///
 /// @param url string URL starting with `http://` or `https://`.
 /// @param opts table? Request options (see above).

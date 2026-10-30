@@ -472,6 +472,7 @@ Your {spec} table must include a name, a description (the model reads it
 to decide when to use the tool), a JSON Schema for the input, and a handler
 function. The handler receives `(input, ctx)` and returns either a plain
 string or a table with richer output fields.
+Returned text replaces invalid UTF-8 bytes with replacement characters.
 
 `ctx:output_mode()` returns "compact" when the result goes to the model and
 "full" when code such as `code_execution` made the call. Apply output limits
@@ -4514,8 +4515,9 @@ response's headers under lowercase names, as in
 `res.headers["retry-after"]`. Repeated headers are joined with `, `,
 which breaks `set-cookie`. A failed response can go straight to
 `maki.provider.http_error`.
-`body` is a byte string, including NUL and non-UTF-8 bytes. Text
-consumers can decode it, and files can be saved with `maki.fs.write`.
+`body` is a byte string, including NUL and non-UTF-8 bytes. Save it
+with `maki.fs.write`. Tool results and `maki.text.html_to_markdown`
+replace invalid UTF-8 when turning bytes into text.
 
 Requires the `net` [plugin permission](#plugin-permissions).
 
@@ -5635,6 +5637,7 @@ maki.text.html_to_markdown({html})
 
 Convert an HTML string to Markdown.
 Useful for cleaning up web content fetched with `maki.webfetch`.
+Invalid UTF-8 bytes are replaced before conversion.
 
 **Parameters:**
 
@@ -8132,6 +8135,8 @@ or a palette index as a string like "4". Names must be spelled exactly,
 hyphens included. Named and indexed colors are left for the terminal to
 resolve, so they follow the user's palette. To mix a named style with colors
 of your own, `maki.ui.theme_style` hands back its parts.
+
+Invalid UTF-8 in text is replaced for display.
 
 **Parameters:**
 
